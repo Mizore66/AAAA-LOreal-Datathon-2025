@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+.venv/
+venv/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data
+dataset (1).zip
+/data/raw/
+/data/interim/
+/data/processed/
+/models/
+/assets/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Extra
+steps.md
