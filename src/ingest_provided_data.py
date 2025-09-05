@@ -3,6 +3,8 @@ import zipfile
 from pathlib import Path
 from typing import Optional, List
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 ROOT = Path(__file__).resolve().parents[1]
 RAW_DIR = ROOT / "data" / "raw"
@@ -120,6 +122,40 @@ def try_prepare_tabular(root: Path, out_dir: Path) -> List[Path]:
     return produced
 
 
+def convert_csv_to_parquet_full(csv_path: Path, out_path: Path, chunksize: int = 500_000) -> Optional[Path]:
+    """Convert a CSV to a single Parquet file using chunked writes to control memory.
+    Returns the output path if written.
+    """
+    try:
+        if out_path.exists():
+            return out_path
+        writer = None
+        total_rows = 0
+        for chunk in pd.read_csv(csv_path, chunksize=chunksize):
+            table = pa.Table.from_pandas(chunk, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(out_path, table.schema, compression='snappy')
+            writer.write_table(table)
+            total_rows += len(chunk)
+        if writer is not None:
+            writer.close()
+            print(f"Wrote {out_path} (rows≈{total_rows})")
+            return out_path
+    except Exception as e:
+        print(f"[WARN] Failed full conversion {csv_path} -> {out_path}: {e}")
+    return None
+
+
+def convert_all_csvs_full(root: Path, out_dir: Path) -> List[Path]:
+    out_paths: List[Path] = []
+    for p in root.rglob('*.csv'):
+        out_p = out_dir / (p.stem + '.parquet')
+        res = convert_csv_to_parquet_full(p, out_p)
+        if res:
+            out_paths.append(res)
+    return out_paths
+
+
 def write_report(zip_found: Optional[Path], extracted_count: int, catalog: pd.DataFrame, converted: List[Path]):
     report_path = INTERIM_DIR / 'ingest_report.md'
     lines = [
@@ -152,6 +188,9 @@ def main():
 
     cat = catalog_files(RAW_DIR)
     converted = try_prepare_tabular(RAW_DIR, PROC_DIR)
+    # Also write full parquet files for all CSVs (chunked) for actual pipeline use
+    full_converted = convert_all_csvs_full(RAW_DIR, PROC_DIR)
+    converted.extend(full_converted)
 
     if DATASET_DESCRIPTION.exists():
         try:
