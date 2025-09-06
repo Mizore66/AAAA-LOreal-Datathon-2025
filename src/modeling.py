@@ -22,10 +22,19 @@ from sklearn.metrics import (
     mean_squared_error, r2_score, f1_score, precision_score, recall_score
 )
 from sklearn.svm import OneClassSVM
+from sklearn.cluster import KMeans
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.exponential_smoothing.ets import ETSModel
+from statsmodels.tsa.seasonal import STL
 from prophet import Prophet
 import scipy.stats as stats
+
+# NLP and Semantic Analysis Libraries
+from transformers import AutoTokenizer, AutoModel, pipeline
+import torch
+import spacy
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Setup paths
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +60,32 @@ class Anomaly:
     platform: Optional[str] = None
     category: Optional[str] = None
     anomaly_type: Optional[str] = None
+    residual_value: Optional[float] = None
+    trend_component: Optional[float] = None
+    seasonal_component: Optional[float] = None
+    cross_platform_correlation: Optional[float] = None
+    semantic_cluster: Optional[int] = None
+
+
+@dataclass
+class TrendState:
+    """Data class for trend lifecycle state."""
+    feature: str
+    state: str  # "Emerging", "Growing", "Peak", "Decaying", "Dormant"
+    growth_rate: float
+    acceleration: float
+    confidence: float
+    timestamp: pd.Timestamp
+
+
+@dataclass
+class SemanticCluster:
+    """Data class for semantic clustering results."""
+    cluster_id: int
+    features: List[str]
+    centroid_embedding: np.ndarray
+    cluster_size: int
+    avg_similarity: float
 
 
 @dataclass
@@ -78,59 +113,609 @@ class ForecastResult:
     confidence_intervals: Optional[pd.DataFrame] = None
 
 
-class TrendDetectionModel:
-    """Advanced trend detection model with multiple algorithms."""
+class STLAnomalyDetector:
+    """STL-based anomaly detection as requested in the specifications."""
     
-    def __init__(self, contamination: float = 0.1):
+    def __init__(self, period: int = 24, seasonal: int = 7, threshold_std: float = 3.0):
+        """
+        Initialize STL anomaly detector.
+        
+        Args:
+            period: Seasonal period for STL decomposition
+            seasonal: Seasonal smoother parameter
+            threshold_std: Number of standard deviations for anomaly threshold
+        """
+        self.period = period
+        self.seasonal = seasonal
+        self.threshold_std = threshold_std
+        self.decomposition_results = {}
+        
+    def decompose_time_series(self, ts_data: pd.Series, feature_name: str) -> Dict[str, pd.Series]:
+        """
+        Perform STL decomposition on time series data.
+        
+        Args:
+            ts_data: Time series data
+            feature_name: Name of the feature being analyzed
+            
+        Returns:
+            Dictionary containing trend, seasonal, and residual components
+        """
+        try:
+            # Ensure minimum length for STL
+            if len(ts_data) < self.period * 2:
+                logger.warning(f"Time series too short for STL decomposition: {feature_name}")
+                return None
+                
+            # Perform STL decomposition
+            stl = STL(ts_data, seasonal=self.seasonal, period=self.period)
+            decomposition = stl.fit()
+            
+            result = {
+                'observed': decomposition.observed,
+                'trend': decomposition.trend,
+                'seasonal': decomposition.seasonal,
+                'resid': decomposition.resid
+            }
+            
+            self.decomposition_results[feature_name] = result
+            return result
+            
+        except Exception as e:
+            logger.error(f"STL decomposition failed for {feature_name}: {e}")
+            return None
+    
+    def detect_anomalies(self, ts_data: pd.Series, feature_name: str, 
+                        platform: Optional[str] = None) -> List[Anomaly]:
+        """
+        Detect anomalies using STL residual analysis.
+        
+        Args:
+            ts_data: Time series data with datetime index
+            feature_name: Name of the feature
+            platform: Platform name (Instagram, TikTok, etc.)
+            
+        Returns:
+            List of detected anomalies
+        """
+        decomposition = self.decompose_time_series(ts_data, feature_name)
+        if decomposition is None:
+            return []
+        
+        residuals = decomposition['resid']
+        trend = decomposition['trend']
+        seasonal = decomposition['seasonal']
+        
+        # Calculate threshold for anomalies
+        residual_std = residuals.std()
+        threshold = self.threshold_std * residual_std
+        
+        # Find anomalies where residual exceeds threshold
+        anomaly_mask = np.abs(residuals) > threshold
+        anomaly_indices = ts_data.index[anomaly_mask]
+        
+        anomalies = []
+        for idx in anomaly_indices:
+            anomaly = Anomaly(
+                feature=feature_name,
+                timestamp=idx,
+                score=abs(residuals[idx]) / residual_std,
+                platform=platform,
+                residual_value=residuals[idx],
+                trend_component=trend[idx],
+                seasonal_component=seasonal[idx],
+                anomaly_type="STL_Residual"
+            )
+            anomalies.append(anomaly)
+        
+        logger.info(f"Detected {len(anomalies)} anomalies for {feature_name}")
+        return anomalies
+
+
+class CrossPlatformValidator:
+    """Cross-platform validation for trend credibility."""
+    
+    def __init__(self, correlation_threshold: float = 0.2):
+        self.correlation_threshold = correlation_threshold
+        
+    def calculate_cross_platform_correlation(self, data: pd.DataFrame) -> Dict[str, float]:
+        """
+        Calculate correlations between features across platforms.
+        
+        Args:
+            data: DataFrame with columns ['feature', 'platform', 'bin', 'count']
+            
+        Returns:
+            Dictionary mapping feature pairs to correlation coefficients
+        """
+        correlations = {}
+        
+        # Group by feature to find cross-platform correlations
+        features = data['feature'].unique()
+        platforms = data['platform'].unique() if 'platform' in data.columns else ['unknown']
+        
+        for feature in features:
+            feature_data = data[data['feature'] == feature]
+            
+            if len(platforms) > 1:
+                # Pivot to get platform columns
+                pivot_data = feature_data.pivot_table(
+                    values='count', 
+                    index='bin', 
+                    columns='platform', 
+                    fill_value=0
+                )
+                
+                # Calculate correlations between platforms for this feature
+                if len(pivot_data.columns) > 1:
+                    corr_matrix = pivot_data.corr()
+                    for i, platform1 in enumerate(pivot_data.columns):
+                        for j, platform2 in enumerate(pivot_data.columns):
+                            if i < j:  # Avoid duplicates
+                                key = f"{feature}_{platform1}_{platform2}"
+                                correlations[key] = corr_matrix.loc[platform1, platform2]
+        
+        return correlations
+    
+    def validate_anomalies(self, anomalies: List[Anomaly], correlations: Dict[str, float]) -> List[Anomaly]:
+        """
+        Validate anomalies using cross-platform correlations.
+        
+        Args:
+            anomalies: List of detected anomalies
+            correlations: Cross-platform correlation dictionary
+            
+        Returns:
+            List of validated anomalies with correlation scores
+        """
+        validated_anomalies = []
+        
+        for anomaly in anomalies:
+            # Find relevant correlation for this anomaly
+            max_correlation = 0.0
+            for corr_key, corr_value in correlations.items():
+                if anomaly.feature in corr_key and (anomaly.platform is None or anomaly.platform in corr_key):
+                    max_correlation = max(max_correlation, abs(corr_value))
+            
+            # Update anomaly with correlation info
+            anomaly.cross_platform_correlation = max_correlation
+            
+            # If no cross-platform data available, still keep the anomaly but with lower confidence
+            # Only filter out if we have strong negative evidence
+            if max_correlation >= self.correlation_threshold or len(correlations) == 0:
+                validated_anomalies.append(anomaly)
+            elif max_correlation == 0.0:  # No correlation data found - keep it
+                validated_anomalies.append(anomaly)
+        
+        logger.info(f"Validated {len(validated_anomalies)} out of {len(anomalies)} anomalies")
+        return validated_anomalies
+
+
+class SemanticAnalyzer:
+    """Semantic validation using sentence transformers."""
+    
+    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+        self.model_name = model_name
+        self.tokenizer = None
+        self.model = None
+        self.embeddings_cache = {}
+        self.embedding_pipeline = None
+        
+    def initialize_model(self):
+        """Initialize the sentence transformer model."""
+        try:
+            # Use a simpler approach for sentence embeddings
+            self.embedding_pipeline = pipeline(
+                "feature-extraction", 
+                model=self.model_name,
+                device=0 if torch.cuda.is_available() else -1
+            )
+            logger.info(f"Initialized semantic model: {self.model_name}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize semantic model: {e}")
+            self.embedding_pipeline = None
+    
+    def get_embeddings(self, texts: List[str]) -> np.ndarray:
+        """
+        Generate embeddings for text features.
+        
+        Args:
+            texts: List of text strings (hashtags, audio titles, etc.)
+            
+        Returns:
+            Array of embeddings
+        """
+        if self.embedding_pipeline is None:
+            self.initialize_model()
+        
+        if self.embedding_pipeline is None:
+            # Fallback to TF-IDF if transformer model fails
+            logger.warning("Using TF-IDF fallback for embeddings")
+            vectorizer = TfidfVectorizer(max_features=100, stop_words='english')
+            embeddings = vectorizer.fit_transform(texts).toarray()
+            return embeddings
+        
+        embeddings = []
+        for text in texts:
+            if text in self.embeddings_cache:
+                embeddings.append(self.embeddings_cache[text])
+            else:
+                try:
+                    # Get embeddings and take mean across tokens
+                    embedding = self.embedding_pipeline(text)[0]
+                    embedding = np.mean(embedding, axis=0)
+                    self.embeddings_cache[text] = embedding
+                    embeddings.append(embedding)
+                except Exception as e:
+                    logger.warning(f"Failed to embed text '{text}': {e}")
+                    # Use zero vector as fallback
+                    embedding = np.zeros(384)  # Default size for MiniLM
+                    embeddings.append(embedding)
+        
+        return np.array(embeddings)
+    
+    def cluster_features(self, features: List[str], n_clusters: int = 5) -> List[SemanticCluster]:
+        """
+        Cluster features by semantic similarity.
+        
+        Args:
+            features: List of feature names
+            n_clusters: Number of clusters
+            
+        Returns:
+            List of semantic clusters
+        """
+        if len(features) < n_clusters:
+            n_clusters = max(1, len(features) // 2)
+        
+        embeddings = self.get_embeddings(features)
+        
+        # Perform K-means clustering
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+        cluster_labels = kmeans.fit_predict(embeddings)
+        
+        # Create cluster objects
+        clusters = []
+        for i in range(n_clusters):
+            cluster_features = [features[j] for j in range(len(features)) if cluster_labels[j] == i]
+            if cluster_features:
+                cluster_embeddings = embeddings[cluster_labels == i]
+                centroid = np.mean(cluster_embeddings, axis=0)
+                
+                # Calculate average similarity within cluster
+                similarities = cosine_similarity(cluster_embeddings)
+                avg_similarity = np.mean(similarities[np.triu_indices_from(similarities, k=1)])
+                
+                cluster = SemanticCluster(
+                    cluster_id=i,
+                    features=cluster_features,
+                    centroid_embedding=centroid,
+                    cluster_size=len(cluster_features),
+                    avg_similarity=avg_similarity if not np.isnan(avg_similarity) else 0.0
+                )
+                clusters.append(cluster)
+        
+        return clusters
+    
+    def validate_semantic_trends(self, anomalies: List[Anomaly], clusters: List[SemanticCluster]) -> List[Anomaly]:
+        """
+        Validate trends using semantic clustering.
+        
+        Args:
+            anomalies: List of detected anomalies
+            clusters: List of semantic clusters
+            
+        Returns:
+            List of anomalies with cluster information
+        """
+        # Create feature to cluster mapping
+        feature_to_cluster = {}
+        for cluster in clusters:
+            for feature in cluster.features:
+                feature_to_cluster[feature] = cluster.cluster_id
+        
+        # Update anomalies with cluster information
+        for anomaly in anomalies:
+            if anomaly.feature in feature_to_cluster:
+                anomaly.semantic_cluster = feature_to_cluster[anomaly.feature]
+        
+        return anomalies
+
+
+class DemographicAnalyzer:
+    """Demographic and category analysis using rule-based approaches."""
+    
+    def __init__(self):
+        self.age_indicators = {
+            'gen_z': ['gen z', 'genz', 'zoomer', 'tiktok', 'university', 'college', '18', '19', '20', '21', '22'],
+            'millennial': ['millennial', '25', '26', '27', '28', '29', '30', '31', '32', '33', '34', '35'],
+            'gen_x': ['gen x', 'genx', '36', '37', '38', '39', '40', '41', '42', '43', '44', '45'],
+            'boomer': ['boomer', 'baby boomer', '50', '55', '60', '65']
+        }
+        
+        self.category_keywords = {
+            'skincare': ['skincare', 'skin care', 'serum', 'moisturizer', 'cleanser', 'toner', 'niacinamide', 'retinol', 'hyaluronic'],
+            'makeup': ['makeup', 'foundation', 'concealer', 'mascara', 'lipstick', 'eyeshadow', 'blush', 'bronzer'],
+            'hair': ['hair', 'shampoo', 'conditioner', 'hair mask', 'hair oil', 'styling', 'hair color'],
+            'lifestyle': ['lifestyle', 'wellness', 'self care', 'routine', 'morning routine', 'night routine']
+        }
+    
+    def analyze_demographics(self, text_data: List[str]) -> Dict[str, int]:
+        """
+        Analyze demographic indicators in text data.
+        
+        Args:
+            text_data: List of text content (bios, descriptions, etc.)
+            
+        Returns:
+            Dictionary with demographic counts
+        """
+        demographics = {age_group: 0 for age_group in self.age_indicators.keys()}
+        
+        for text in text_data:
+            text_lower = text.lower()
+            for age_group, indicators in self.age_indicators.items():
+                if any(indicator in text_lower for indicator in indicators):
+                    demographics[age_group] += 1
+        
+        return demographics
+    
+    def classify_category(self, feature_text: str) -> str:
+        """
+        Classify a feature into beauty categories.
+        
+        Args:
+            feature_text: Text to classify
+            
+        Returns:
+            Category name
+        """
+        text_lower = feature_text.lower()
+        
+        for category, keywords in self.category_keywords.items():
+            if any(keyword in text_lower for keyword in keywords):
+                return category
+        
+        return 'other'
+
+
+class SentimentAnalyzer:
+    """Sentiment analysis for trend-related content."""
+    
+    def __init__(self):
+        self.sentiment_pipeline = None
+        
+    def initialize_sentiment_model(self):
+        """Initialize sentiment analysis pipeline."""
+        try:
+            self.sentiment_pipeline = pipeline(
+                "sentiment-analysis",
+                model="cardiffnlp/twitter-roberta-base-sentiment-latest",
+                device=0 if torch.cuda.is_available() else -1
+            )
+            logger.info("Initialized sentiment analysis model")
+        except Exception as e:
+            logger.warning(f"Failed to initialize sentiment model: {e}")
+            # Use a simpler fallback
+            try:
+                self.sentiment_pipeline = pipeline("sentiment-analysis")
+                logger.info("Using fallback sentiment model")
+            except:
+                self.sentiment_pipeline = None
+    
+    def analyze_sentiment(self, texts: List[str]) -> List[Dict[str, float]]:
+        """
+        Analyze sentiment of text content.
+        
+        Args:
+            texts: List of text content
+            
+        Returns:
+            List of sentiment scores
+        """
+        if self.sentiment_pipeline is None:
+            self.initialize_sentiment_model()
+        
+        if self.sentiment_pipeline is None:
+            return [{'positive': 0.5, 'negative': 0.5, 'neutral': 0.5} for _ in texts]
+        
+        sentiments = []
+        for text in texts:
+            try:
+                result = self.sentiment_pipeline(text)
+                sentiment_dict = {'positive': 0.0, 'negative': 0.0, 'neutral': 0.0}
+                
+                for item in result:
+                    label = item['label'].lower()
+                    score = item['score']
+                    
+                    if 'pos' in label:
+                        sentiment_dict['positive'] = score
+                    elif 'neg' in label:
+                        sentiment_dict['negative'] = score
+                    else:
+                        sentiment_dict['neutral'] = score
+                
+                sentiments.append(sentiment_dict)
+            except Exception as e:
+                logger.warning(f"Sentiment analysis failed for text: {e}")
+                sentiments.append({'positive': 0.5, 'negative': 0.5, 'neutral': 0.5})
+        
+        return sentiments
+
+
+class TrendDecayDetector:
+    """Detect trend decay using growth rate and acceleration analysis."""
+    
+    def __init__(self, decay_period: int = 7):
+        self.decay_period = decay_period
+    
+    def calculate_derivatives(self, ts_data: pd.Series) -> Tuple[pd.Series, pd.Series]:
+        """
+        Calculate first and second derivatives of time series.
+        
+        Args:
+            ts_data: Time series data
+            
+        Returns:
+            Tuple of (first_derivative, second_derivative)
+        """
+        # First derivative (growth rate)
+        first_derivative = ts_data.diff()
+        
+        # Second derivative (acceleration)
+        second_derivative = first_derivative.diff()
+        
+        return first_derivative, second_derivative
+    
+    def detect_trend_state(self, ts_data: pd.Series, feature_name: str) -> List[TrendState]:
+        """
+        Detect trend lifecycle states.
+        
+        Args:
+            ts_data: Time series data
+            feature_name: Name of the feature
+            
+        Returns:
+            List of trend states over time
+        """
+        first_deriv, second_deriv = self.calculate_derivatives(ts_data)
+        
+        trend_states = []
+        
+        for i in range(len(ts_data)):
+            if i < self.decay_period:
+                continue
+                
+            # Look at recent period
+            recent_growth = first_deriv.iloc[i-self.decay_period:i+1]
+            recent_accel = second_deriv.iloc[i-self.decay_period:i+1]
+            
+            growth_rate = recent_growth.mean() if not recent_growth.isna().all() else 0
+            acceleration = recent_accel.mean() if not recent_accel.isna().all() else 0
+            
+            # Determine trend state
+            if growth_rate > 0 and acceleration > 0:
+                state = "Growing"
+                confidence = min(0.9, abs(growth_rate) * abs(acceleration) / 100)
+            elif growth_rate > 0 and acceleration < 0:
+                state = "Decaying"
+                confidence = min(0.9, abs(growth_rate) * abs(acceleration) / 100)
+            elif growth_rate < 0:
+                state = "Dormant"
+                confidence = min(0.8, abs(growth_rate) / 10)
+            elif abs(growth_rate) < 0.1:
+                state = "Peak"
+                confidence = 0.6
+            else:
+                state = "Emerging"
+                confidence = 0.5
+            
+            trend_state = TrendState(
+                feature=feature_name,
+                state=state,
+                growth_rate=growth_rate,
+                acceleration=acceleration,
+                confidence=confidence,
+                timestamp=ts_data.index[i]
+            )
+            trend_states.append(trend_state)
+        
+        return trend_states
+
+
+class TrendDetectionModel:
+    """
+    Comprehensive trend detection model implementing STL-based anomaly detection
+    with cross-platform validation, semantic analysis, and decay detection.
+    """
+    
+    def __init__(self, contamination: float = 0.1, period: int = 24, threshold_std: float = 3.0):
         self.contamination = contamination
-        self.isolation_forest = IsolationForest(contamination=contamination, random_state=42)
-        self.one_class_svm = OneClassSVM(nu=contamination)
-        self.scaler = StandardScaler()
+        self.period = period
+        self.threshold_std = threshold_std
+        
+        # Initialize components
+        self.stl_detector = STLAnomalyDetector(period=period, threshold_std=threshold_std)
+        self.cross_platform_validator = CrossPlatformValidator()
+        self.semantic_analyzer = SemanticAnalyzer()
+        self.demographic_analyzer = DemographicAnalyzer()
+        self.sentiment_analyzer = SentimentAnalyzer()
+        self.decay_detector = TrendDecayDetector()
+        
         self.is_fitted = False
         
-    def prepare_features(self, df: pd.DataFrame) -> np.ndarray:
-        """Prepare features for anomaly detection."""
-        feature_cols = ['count', 'rolling_mean_24h', 'delta_vs_mean']
-        if 'velocity' in df.columns:
-            feature_cols.append('velocity')
-        if 'growth_rate' in df.columns:
-            feature_cols.append('growth_rate')
-        
-        features = df[feature_cols].fillna(0)
-        return features.values
-    
     def fit(self, df: pd.DataFrame):
-        """Fit anomaly detection models."""
-        features = self.prepare_features(df)
-        features_scaled = self.scaler.fit_transform(features)
-        
-        self.isolation_forest.fit(features_scaled)
-        self.one_class_svm.fit(features_scaled)
+        """Fit the trend detection model."""
         self.is_fitted = True
-        logger.info("Trend detection models fitted successfully")
+        logger.info("STL-based trend detection model fitted successfully")
     
     def predict_anomalies(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Predict anomalies in the data."""
+        """
+        Predict anomalies using the comprehensive STL-based approach.
+        
+        Args:
+            df: DataFrame with trend data
+            
+        Returns:
+            DataFrame with detected anomalies and additional analysis
+        """
         if not self.is_fitted:
             raise ValueError("Model must be fitted before prediction")
         
-        features = self.prepare_features(df)
-        features_scaled = self.scaler.transform(features)
+        all_anomalies = []
+        all_trend_states = []
         
-        # Get predictions from both models
-        if_pred = self.isolation_forest.predict(features_scaled)
-        if_scores = self.isolation_forest.score_samples(features_scaled)
+        # Process each feature individually
+        features = df['feature'].unique() if 'feature' in df.columns else [df.columns[0]]
         
-        svm_pred = self.one_class_svm.predict(features_scaled)
+        for feature in features:
+            feature_data = df[df['feature'] == feature] if 'feature' in df.columns else df
+            
+            # Create time series
+            if 'bin' in feature_data.columns:
+                ts_data = feature_data.set_index('bin')['count']
+            else:
+                ts_data = feature_data.iloc[:, -1]  # Assume last column is the value
+            
+            ts_data.index = pd.to_datetime(ts_data.index)
+            ts_data = ts_data.sort_index()
+            
+            platform = feature_data['platform'].iloc[0] if 'platform' in feature_data.columns else None
+            
+            # 1. STL-based anomaly detection
+            feature_anomalies = self.stl_detector.detect_anomalies(ts_data, feature, platform)
+            all_anomalies.extend(feature_anomalies)
+            
+            # 2. Decay detection
+            trend_states = self.decay_detector.detect_trend_state(ts_data, feature)
+            all_trend_states.extend(trend_states)
         
-        # Combine results
-        results = df.copy()
-        results['isolation_forest_anomaly'] = if_pred == -1
-        results['isolation_forest_score'] = if_scores
-        results['svm_anomaly'] = svm_pred == -1
-        results['ensemble_anomaly'] = (if_pred == -1) | (svm_pred == -1)
+        # 3. Cross-platform validation
+        if len(all_anomalies) > 0:
+            correlations = self.cross_platform_validator.calculate_cross_platform_correlation(df)
+            all_anomalies = self.cross_platform_validator.validate_anomalies(all_anomalies, correlations)
         
-        return results[results['ensemble_anomaly']]
+        # 4. Semantic validation
+        feature_names = [anomaly.feature for anomaly in all_anomalies]
+        if feature_names:
+            clusters = self.semantic_analyzer.cluster_features(list(set(feature_names)))
+            all_anomalies = self.semantic_analyzer.validate_semantic_trends(all_anomalies, clusters)
+        
+        # Convert results to DataFrame
+        if all_anomalies:
+            anomaly_records = []
+            for anomaly in all_anomalies:
+                record = asdict(anomaly)
+                record['timestamp'] = record['timestamp'].isoformat() if record['timestamp'] else None
+                anomaly_records.append(record)
+            
+            results_df = pd.DataFrame(anomaly_records)
+        else:
+            results_df = pd.DataFrame()
+        
+        logger.info(f"Detected {len(all_anomalies)} anomalies using STL-based approach")
+        return results_df
 
 
 class TimeSeriesForecaster:
@@ -557,13 +1142,13 @@ def generate_model_report(results: Dict[str, Any]):
     anomalies = results['trend_detection'].get('anomalies', pd.DataFrame())
     if not anomalies.empty:
         lines.append(f"- Anomalies detected: {len(anomalies)}")
-        lines.append("- Models used: Isolation Forest + One-Class SVM ensemble")
+        lines.append("- Models used: STL Decomposition with Cross-Platform & Semantic Validation")
         
         # Top anomalies
-        top_anomalies = anomalies.nlargest(10, 'isolation_forest_score')
+        top_anomalies = anomalies.nlargest(10, 'score')
         lines.append("\n### Top Anomalies Detected")
         try:
-            cols = ['feature', 'bin', 'count', 'isolation_forest_score', 'category']
+            cols = ['feature', 'timestamp', 'score', 'anomaly_type', 'platform', 'semantic_cluster']
             cols = [c for c in cols if c in top_anomalies.columns]
             lines.append(top_anomalies[cols].to_markdown(index=False))
         except Exception as e:
