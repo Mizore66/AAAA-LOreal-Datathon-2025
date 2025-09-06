@@ -53,12 +53,44 @@ Outputs:
 - Parquet files under `data/processed/`
 - A report at `data/interim/ingest_report.md`
 
-## Full dependencies
+## Pipeline Executor (NEW)
+
+For automated execution and external agent delegation:
+
+```bash
+# Run complete pipeline with auto-commit
+python pipeline_executor.py
+
+# Run without committing (for testing)
+python pipeline_executor.py --no-commit
+
+# Force regenerate all files
+python pipeline_executor.py --force-regenerate
+```
+
+See `PIPELINE_DOCUMENTATION.md` for detailed documentation.
+
+## Manual Pipeline Execution
+
+### Full dependencies
 
 Install everything for modeling and the Streamlit app:
 
 ```
 pip install -r requirements.txt
+```
+
+### Manual execution steps
+
+```bash
+# Step 1: Data ingestion
+python src/ingest_provided_data.py
+
+# Step 2: Feature engineering and multi-timeframe aggregation
+python src/data_processing.py
+
+# Step 3: Advanced modeling (optional, requires additional dependencies)
+python src/modeling.py
 ```
 
 ## Notes on data ethics and platform ToS

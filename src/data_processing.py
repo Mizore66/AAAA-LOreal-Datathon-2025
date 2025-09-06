@@ -761,8 +761,25 @@ def aggregate_audio_timeframe(dfs: List[Tuple[str,pd.DataFrame]], label: str) ->
     return allg
 
 
-def write_parquet(df: pd.DataFrame, name: str) -> Path:
+def check_parquet_exists(name: str) -> bool:
+    """Check if parquet file already exists with data."""
+    out_path = PROC_DIR / name
+    if out_path.exists():
+        try:
+            df = pd.read_parquet(out_path)
+            if len(df) > 0:
+                print(f"Skipping {name} - file already exists with {len(df)} rows")
+                return True
+        except Exception as e:
+            print(f"[WARN] Failed to read existing {name}: {e}")
+    return False
+
+
+def write_parquet(df: pd.DataFrame, name: str, force: bool = False) -> Path:
+    """Write parquet file, optionally skipping if it already exists with data."""
     out = PROC_DIR / name
+    if not force and check_parquet_exists(name):
+        return out
     df.to_parquet(out, index=False)
     print(f"Wrote {out}")
     return out
@@ -958,15 +975,26 @@ def main():
         if label == '6h':
             continue  # already done
         try:
-            h_tf = aggregate_hashtags_timeframe(text_sources, label)
-            k_tf = aggregate_keywords_timeframe(text_sources, label)
-            a_tf = aggregate_audio_timeframe(text_sources, label)
-            if not h_tf.empty:
-                write_parquet(h_tf, f'features_hashtags_{label}.parquet')
-            if not k_tf.empty:
-                write_parquet(k_tf, f'features_keywords_{label}.parquet')
-            if not a_tf.empty:
-                write_parquet(a_tf, f'features_audio_{label}.parquet')
+            h_name = f'features_hashtags_{label}.parquet'
+            k_name = f'features_keywords_{label}.parquet'
+            a_name = f'features_audio_{label}.parquet'
+            
+            # Check if files already exist before computing
+            if not check_parquet_exists(h_name):
+                h_tf = aggregate_hashtags_timeframe(text_sources, label)
+                if not h_tf.empty:
+                    write_parquet(h_tf, h_name)
+            
+            if not check_parquet_exists(k_name):
+                k_tf = aggregate_keywords_timeframe(text_sources, label)
+                if not k_tf.empty:
+                    write_parquet(k_tf, k_name)
+            
+            if not check_parquet_exists(a_name):
+                a_tf = aggregate_audio_timeframe(text_sources, label)
+                if not a_tf.empty:
+                    write_parquet(a_tf, a_name)
+                    
         except Exception as e:
             print(f"[WARN] Failed timeframe aggregation {label}: {e}")
     print("[Phase2] Multi-timeframe aggregations completed.")
@@ -990,10 +1018,11 @@ def main():
     ts_clusters = identify_trend_clusters(ts_emerging, similarity_threshold=0.6)
     
     # Save Phase 3 outputs
-    write_parquet(ts_emerging, 'features_emerging_terms_6h.parquet')
-    if not ts_anomalies.empty:
+    if not check_parquet_exists('features_emerging_terms_6h.parquet'):
+        write_parquet(ts_emerging, 'features_emerging_terms_6h.parquet')
+    if not ts_anomalies.empty and not check_parquet_exists('features_statistical_anomalies.parquet'):
         write_parquet(ts_anomalies, 'features_statistical_anomalies.parquet')
-    if not ts_clusters.empty:
+    if not ts_clusters.empty and not check_parquet_exists('trend_clusters.parquet'):
         write_parquet(ts_clusters, 'trend_clusters.parquet')
     
     # Generate comprehensive Phase 3 report
