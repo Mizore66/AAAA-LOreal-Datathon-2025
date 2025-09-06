@@ -235,3 +235,49 @@ hint: Disable this message with "git config set advice.addIgnoredFile false"
 2025-09-06 08:03:12,841 - INFO - Generated 6 files
 2025-09-06 08:03:12,841 - INFO - Execution time: 3.2 seconds
 2025-09-06 08:03:12,841 - INFO - ============================================================
+2025-09-06 08:14:03,912 - INFO - ============================================================
+2025-09-06 08:14:03,912 - INFO - STARTING PIPELINE EXECUTION
+2025-09-06 08:14:03,912 - INFO - ============================================================
+2025-09-06 08:14:03,912 - INFO - Checking prerequisites...
+2025-09-06 08:14:03,912 - ERROR - Missing required Python package: No module named 'pandas'
+2025-09-06 08:14:03,912 - ERROR - Prerequisites check failed
+2025-09-06 08:16:54,119 - INFO - ============================================================
+2025-09-06 08:16:54,120 - INFO - STARTING PIPELINE EXECUTION
+2025-09-06 08:16:54,120 - INFO - ============================================================
+2025-09-06 08:16:54,120 - INFO - Checking prerequisites...
+2025-09-06 08:16:54,531 - INFO - Core dependencies available
+2025-09-06 08:16:54,531 - INFO - Prerequisites check passed
+2025-09-06 08:16:54,531 - INFO - Running data ingestion...
+2025-09-06 08:16:55,030 - INFO - Data ingestion completed successfully
+2025-09-06 08:16:55,030 - INFO - Running data processing and feature engineering...
+2025-09-06 08:16:55,768 - INFO - Data processing completed successfully
+2025-09-06 08:16:55,768 - INFO - Running modeling pipeline...
+2025-09-06 08:16:56,272 - INFO - Failed to extract font properties from /usr/share/fonts/truetype/noto/NotoColorEmoji.ttf: In FT2Font: Can not load face (unknown file format; error code 0x2)
+2025-09-06 08:16:57,190 - INFO - generated new fontManager
+2025-09-06 08:17:01,765 - INFO - Modeling completed successfully
+2025-09-06 08:17:01,766 - INFO - Found 10 newly generated files
+2025-09-06 08:17:01,767 - INFO - Execution report saved: /home/runner/work/AAAA-LOreal-Datathon-2025/AAAA-LOreal-Datathon-2025/data/interim/pipeline_execution_20250906_081654.json
+2025-09-06 08:17:01,767 - INFO - ============================================================
+2025-09-06 08:17:01,767 - INFO - PIPELINE EXECUTION COMPLETED SUCCESSFULLY
+2025-09-06 08:17:01,767 - INFO - Generated 10 files
+2025-09-06 08:17:01,767 - INFO - Execution time: 7.6 seconds
+2025-09-06 08:17:01,767 - INFO - ============================================================
+2025-09-06 08:18:16,747 - INFO - ============================================================
+2025-09-06 08:18:16,747 - INFO - STARTING PIPELINE EXECUTION
+2025-09-06 08:18:16,747 - INFO - ============================================================
+2025-09-06 08:18:16,747 - INFO - Checking prerequisites...
+2025-09-06 08:18:17,064 - INFO - Core dependencies available
+2025-09-06 08:18:17,064 - INFO - Prerequisites check passed
+2025-09-06 08:18:17,065 - INFO - Running data ingestion...
+2025-09-06 08:18:17,568 - INFO - Data ingestion completed successfully
+2025-09-06 08:18:17,568 - INFO - Running data processing and feature engineering...
+2025-09-06 08:18:21,826 - INFO - Data processing completed successfully
+2025-09-06 08:18:21,827 - INFO - Running modeling pipeline...
+2025-09-06 08:18:39,425 - INFO - Modeling completed successfully
+2025-09-06 08:18:39,426 - INFO - Found 32 newly generated files
+2025-09-06 08:18:39,427 - INFO - Execution report saved: /home/runner/work/AAAA-LOreal-Datathon-2025/AAAA-LOreal-Datathon-2025/data/interim/pipeline_execution_20250906_081816.json
+2025-09-06 08:18:39,427 - INFO - ============================================================
+2025-09-06 08:18:39,427 - INFO - PIPELINE EXECUTION COMPLETED SUCCESSFULLY
+2025-09-06 08:18:39,428 - INFO - Generated 32 files
+2025-09-06 08:18:39,428 - INFO - Execution time: 22.7 seconds
+2025-09-06 08:18:39,428 - INFO - ============================================================
