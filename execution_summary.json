@@ -1,0 +1,28 @@
+{
+  "execution_timestamp": "2025-09-06T08:02:51.479458",
+  "pipeline_version": "1.0",
+  "generated_files_count": 28,
+  "generated_files_summary": {
+    "trend_analysis": 1,
+    "feature_aggregation": 23,
+    "other": 1,
+    "reports": 3
+  },
+  "feature_timeframes": [
+    "1m",
+    "1d",
+    "6h",
+    "3d",
+    "3h",
+    "6m",
+    "1h",
+    "14d",
+    "7d",
+    "3m"
+  ],
+  "reports_generated": [
+    "tabular_profiles.md",
+    "ingest_report.md",
+    "phase3_advanced_trends_report.md"
+  ]
+}
