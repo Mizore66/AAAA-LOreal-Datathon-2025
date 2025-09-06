@@ -54,6 +54,9 @@ def catalog_files(root: Path) -> pd.DataFrame:
                 'suffix': p.suffix.lower(),
                 'size_bytes': p.stat().st_size,
             })
+    if not rows:
+        # Return empty DataFrame with proper columns if no files found
+        return pd.DataFrame(columns=['relative_path', 'suffix', 'size_bytes'])
     return pd.DataFrame(rows).sort_values('relative_path')
 
 
