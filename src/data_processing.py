@@ -13,7 +13,7 @@ warnings.filterwarnings('ignore')
 # -----------------------------
 # Performance / Fast Mode Controls
 # -----------------------------
-FAST_MODE = True                 # Global switch to reduce computation cost
+FAST_MODE = False                # Global switch to reduce computation cost
 MAX_FEATURES_EMERGING = 400      # Cap emerging term features per timeframe
 MAX_FEATURES_ANOMALY = 400       # Cap features for statistical anomaly scan
 MAX_CLUSTER_FEATURES = 250       # Cap features for clustering
