@@ -628,6 +628,139 @@ def aggregate_audio_6h(dfs: List[Tuple[str, pd.DataFrame]]) -> pd.DataFrame:
     return allg
 
 
+# -----------------------------
+# Multi-timeframe aggregation extensions
+# -----------------------------
+
+TIMEFRAME_LABELS = [
+    '1h','3h','6h','1d','3d','7d','14d','1m','3m','6m'
+]
+
+_FREQ_MAP = {
+    '1h': '1H',
+    '3h': '3H',
+    '6h': '6H',
+    '1d': '1D',
+    '3d': '3D',
+    '7d': '7D',
+    '14d': '14D'
+    # month-based handled separately
+}
+
+_ROLLING_WINDOW = {
+    # Window sizes chosen to approximate similar historical coverage across granularities
+    '1h': 24,   # past day
+    '3h': 8,    # past day
+    '6h': 4,    # existing behavior (24h)
+    '1d': 7,    # past week
+    '3d': 7,    # ~3 weeks
+    '7d': 4,    # ~4 weeks
+    '14d': 4,   # ~8 weeks
+    '1m': 6,    # past 6 months
+    '3m': 4,    # past year
+    '6m': 4     # past 2 years
+}
+
+def _assign_time_bin(ts: pd.Series, label: str) -> pd.Series:
+    if label in _FREQ_MAP:
+        return ts.dt.floor(_FREQ_MAP[label])
+    if label == '1m':
+        return ts.dt.to_period('M').dt.to_timestamp()
+    if label == '3m':  # quarter
+        return ts.dt.to_period('Q').dt.to_timestamp()
+    if label == '6m':  # half-year custom
+        years = ts.dt.year
+        months = ts.dt.month
+        start_month = np.where(months <= 6, 1, 7)
+        return pd.to_datetime({'year': years, 'month': start_month, 'day': 1})
+    raise ValueError(f"Unsupported timeframe label: {label}")
+
+def _add_rolling_stats(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    window = _ROLLING_WINDOW.get(label, 4)
+    df = df.sort_values(["feature","bin"]).reset_index(drop=True)
+    df["rolling_mean_24h"] = (
+        df.groupby("feature")["count"].transform(lambda s: s.rolling(window=window, min_periods=1).mean())
+    )
+    df["delta_vs_mean"] = df["count"] - df["rolling_mean_24h"]
+    return df
+
+def aggregate_hashtags_timeframe(dfs: List[Tuple[str,pd.DataFrame]], label: str) -> pd.DataFrame:
+    if label == '6h':
+        return aggregate_hashtags_6h(dfs)
+    frames = []
+    for name, df in tqdm(dfs, desc=f"Aggregating hashtags ({label})", unit="src"):
+        p = _prepare_text_df(df)
+        if p is None or p.empty:
+            continue
+        pe = p[["ts","hashtags"]].explode("hashtags").dropna(subset=["hashtags"]) 
+        if pe.empty:
+            continue
+        pe['bin'] = _assign_time_bin(pe['ts'], label)
+        g = pe.groupby(['bin','hashtags'], as_index=False).size().rename(columns={'size':'count'})
+        g = g.rename(columns={'hashtags':'feature'})
+        g['category'] = g['feature'].map(categorize_feature)
+        frames.append(g)
+    if not frames:
+        return pd.DataFrame(columns=["bin","feature","count","rolling_mean_24h","delta_vs_mean","category"])    
+    allg = pd.concat(frames, ignore_index=True)
+    allg = allg.groupby(["bin","feature","category"], as_index=False)['count'].sum()
+    allg = _add_rolling_stats(allg, label)
+    return allg
+
+def aggregate_keywords_timeframe(dfs: List[Tuple[str,pd.DataFrame]], label: str) -> pd.DataFrame:
+    if label == '6h':
+        return aggregate_keywords_6h(dfs)
+    frames = []
+    kw_patterns = [(kw, re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE)) for kw in KEYWORDS]
+    for name, df in tqdm(dfs, desc=f"Aggregating keywords ({label})", unit="src"):
+        p = _prepare_text_df(df)
+        if p is None or p.empty:
+            continue
+        p['bin'] = _assign_time_bin(p['ts'], label)
+        for kw, pat in kw_patterns:
+            mask = p['text_clean'].str.contains(pat)
+            if not mask.any():
+                continue
+            g = p.loc[mask].groupby('bin', as_index=False).size().rename(columns={'size':'count'})
+            g['feature'] = kw
+            g['category'] = categorize_feature(kw)
+            frames.append(g)
+    if not frames:
+        return pd.DataFrame(columns=["bin","feature","count","rolling_mean_24h","delta_vs_mean","category"]) 
+    allg = pd.concat(frames, ignore_index=True)
+    allg = allg.groupby(["bin","feature","category"], as_index=False)['count'].sum()
+    allg = _add_rolling_stats(allg, label)
+    return allg
+
+def aggregate_audio_timeframe(dfs: List[Tuple[str,pd.DataFrame]], label: str) -> pd.DataFrame:
+    if label == '6h':
+        return aggregate_audio_6h(dfs)
+    frames: List[pd.DataFrame] = []
+    for name, df in tqdm(dfs, desc=f"Aggregating audio ({label})", unit="src"):
+        ts_col = find_timestamp_column(df)
+        audio_col = find_audio_column(df)
+        if not ts_col or not audio_col:
+            continue
+        use = df[[ts_col, audio_col]].copy()
+        use['ts'] = pd.to_datetime(use[ts_col], errors='coerce')
+        use = use.dropna(subset=['ts', audio_col])
+        if use.empty:
+            continue
+        use['bin'] = _assign_time_bin(use['ts'], label)
+        g = use.groupby(['bin', audio_col], as_index=False).size().rename(columns={'size':'count'})
+        g = g.rename(columns={audio_col:'feature'})
+        g['category'] = 'Other'
+        frames.append(g)
+    if not frames:
+        return pd.DataFrame(columns=["bin","feature","count","rolling_mean_24h","delta_vs_mean","category"]) 
+    allg = pd.concat(frames, ignore_index=True)
+    allg = allg.groupby(['bin','feature','category'], as_index=False)['count'].sum()
+    allg = _add_rolling_stats(allg, label)
+    return allg
+
+
 def write_parquet(df: pd.DataFrame, name: str) -> Path:
     out = PROC_DIR / name
     df.to_parquet(out, index=False)
@@ -818,6 +951,25 @@ def main():
     write_parquet(ts_hashtags, 'features_hashtags_6h.parquet')
     write_parquet(ts_keywords, 'features_keywords_6h.parquet')
     write_parquet(ts_audio, 'features_audio_6h.parquet')
+
+    # Extended multi-timeframe aggregations
+    print("[Phase2] Multi-timeframe aggregations starting...")
+    for label in TIMEFRAME_LABELS:
+        if label == '6h':
+            continue  # already done
+        try:
+            h_tf = aggregate_hashtags_timeframe(text_sources, label)
+            k_tf = aggregate_keywords_timeframe(text_sources, label)
+            a_tf = aggregate_audio_timeframe(text_sources, label)
+            if not h_tf.empty:
+                write_parquet(h_tf, f'features_hashtags_{label}.parquet')
+            if not k_tf.empty:
+                write_parquet(k_tf, f'features_keywords_{label}.parquet')
+            if not a_tf.empty:
+                write_parquet(a_tf, f'features_audio_{label}.parquet')
+        except Exception as e:
+            print(f"[WARN] Failed timeframe aggregation {label}: {e}")
+    print("[Phase2] Multi-timeframe aggregations completed.")
 
     write_phase2_report(ts_hashtags, ts_keywords, ts_audio)
     
