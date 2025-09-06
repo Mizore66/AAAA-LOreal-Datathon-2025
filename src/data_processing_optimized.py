@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # -----------------------------
 # Enhanced Performance Controls
 # -----------------------------
-PERFORMANCE_MODE = "OPTIMIZED"  # Options: "OPTIMIZED", "BALANCED", "THOROUGH"
+PERFORMANCE_MODE = "BALANCED"  # Options: "OPTIMIZED", "BALANCED", "THOROUGH"
 MAX_WORKERS = min(4, (psutil.cpu_count() or 1))  # Adaptive CPU usage
 MEMORY_THRESHOLD_GB = 8  # Switch to streaming mode if dataset > this size
 CACHE_VERSION = "v2.0"  # Increment to invalidate old caches
@@ -183,6 +183,20 @@ _ROLLING_WINDOW = {
 
 _MIN_FREQ_BY_LABEL = {
     '1h': 2, '3h': 2, '6h': 3, '1d': 5, '3d': 5, '7d': 8, '14d': 10, '1m': 15, '3m': 20, '6m': 30
+}
+
+# Growth rate thresholds tuned per timeframe (lower thresholds for longer periods)
+MIN_GROWTH_RATE_BY_LABEL = {
+    '1h': 2.5,
+    '3h': 2.5,
+    '6h': 2.5,
+    '1d': 2.0,
+    '3d': 1.8,
+    '7d': 1.6,
+    '14d': 1.5,
+    '1m': 1.4,
+    '3m': 1.3,
+    '6m': 1.2
 }
 
 # -----------------------------
@@ -756,154 +770,112 @@ def calculate_term_velocity_optimized(term_counts: pd.DataFrame, term: str, wind
 # Enhanced Phase 2 Reporting with ALL Timeframes
 # -----------------------------
 
-def write_enhanced_phase2_report(baseline_data: Dict[str, pd.DataFrame]):
-    """Enhanced Phase 2 report showing ALL timeframe aggregation data."""
-    logger.info("Generating enhanced Phase 2 report with all timeframes")
-    
+def write_enhanced_phase2_report(all_timeframe_data: Dict[str, pd.DataFrame]):
+    """Enhanced Phase 2 report using ALL timeframe aggregation data passed in (no longer just 6h baseline)."""
+    logger.info("Generating enhanced Phase 2 report from provided multi-timeframe data")
+
     path = INTERIM_DIR / 'phase2_enhanced_features_report.md'
     lines = ["# Enhanced Phase 2 Feature Engineering Report", ""]
     lines.append(f"Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"Performance Mode: {PERFORMANCE_MODE}")
     lines.append("")
-    
-    # Summary of 6h baseline
-    h_df = baseline_data.get('hashtags', pd.DataFrame())
-    k_df = baseline_data.get('keywords', pd.DataFrame())
-    a_df = baseline_data.get('audio', pd.DataFrame())
-    
-    lines.append("## Summary (6h Baseline)")
-    lines.append(f"- Hashtag features: {len(h_df):,} rows")
-    lines.append(f"- Keyword features: {len(k_df):,} rows")
-    lines.append(f"- Audio features: {len(a_df):,} rows")
-    lines.append("")
-    
-    # Comprehensive multi-frequency analysis
-    lines.append("## Comprehensive Multi-Frequency Analysis")
-    
-    # Inventory all generated files
-    inventory = []
-    feature_types = set()
-    
-    for p in PROC_DIR.glob('features_*.parquet'):
-        if 'statistical_anomalies' in p.name or 'emerging_terms' in p.name:
+
+    # Build unified summary from all provided dataframes
+    lines.append("## Overall Summary (All Timeframes)")
+    summary_rows = []
+    for ftype, df in all_timeframe_data.items():
+        if df is None or df.empty:
+            summary_rows.append({
+                'Feature_Type': ftype,
+                'Total_Rows': 0,
+                'Unique_Features': 0,
+                'Timeframes': 0
+            })
             continue
-        
+        tf_count = df['timeframe'].nunique() if 'timeframe' in df.columns else 1
+        summary_rows.append({
+            'Feature_Type': ftype,
+            'Total_Rows': len(df),
+            'Unique_Features': df['feature'].nunique() if 'feature' in df.columns else 0,
+            'Timeframes': tf_count
+        })
+    if summary_rows:
         try:
-            dfp = pd.read_parquet(p)
-            parts = p.stem.split('_')
-            if len(parts) >= 3:
-                feature_type = '_'.join(parts[1:-1])  # e.g., "hashtags", "keywords", "audio"
-                timeframe = parts[-1]  # e.g., "1h", "6h", "1d"
-                
-                feature_types.add(feature_type)
-                
-                # Calculate additional metrics
-                unique_features = dfp['feature'].nunique() if 'feature' in dfp.columns else 0
-                latest_bin = dfp['bin'].max() if 'bin' in dfp.columns else None
-                total_count = dfp['count'].sum() if 'count' in dfp.columns else 0
-                
-                inventory.append({
-                    'Feature_Type': feature_type.title(),
-                    'Timeframe': timeframe,
-                    'Rows': len(dfp),
-                    'Unique_Features': unique_features,
-                    'Total_Count': total_count,
-                    'Latest_Bin': latest_bin.strftime('%Y-%m-%d %H:%M') if latest_bin else 'N/A',
-                    'File_Size_KB': p.stat().st_size // 1024
-                })
+            lines.append(pd.DataFrame(summary_rows).to_markdown(index=False))
         except Exception as e:
-            logger.warning(f"Could not process {p.name}: {e}")
-    
-    if inventory:
-        lines.append("### Complete Feature Inventory")
-        inv_df = pd.DataFrame(inventory).sort_values(['Feature_Type', 'Timeframe'])
-        try:
-            lines.append(inv_df.to_markdown(index=False))
-        except Exception as e:
-            lines.append(f"Could not render inventory table: {e}")
-        lines.append("")
-        
-        # Summary statistics by feature type
-        lines.append("### Feature Type Statistics")
-        for feature_type in sorted(feature_types):
-            type_data = inv_df[inv_df['Feature_Type'] == feature_type.title()]
-            total_rows = type_data['Rows'].sum()
-            total_features = type_data['Unique_Features'].sum()
-            timeframes_count = len(type_data)
-            
-            lines.append(f"**{feature_type.title()}**:")
-            lines.append(f"- Timeframes: {timeframes_count}")
-            lines.append(f"- Total rows across all timeframes: {total_rows:,}")
-            lines.append(f"- Total unique features: {total_features:,}")
-            lines.append("")
-        
-        # Timeframe comparison
-        lines.append("### Timeframe Comparison")
-        timeframe_summary = inv_df.groupby('Timeframe').agg({
-            'Rows': 'sum',
-            'Unique_Features': 'sum',
-            'Total_Count': 'sum'
-        }).reset_index()
-        timeframe_summary = timeframe_summary.sort_values('Timeframe')
-        
+            lines.append(f"(Could not render summary table: {e})")
+    lines.append("")
+
+    # Timeframe comparison across all feature types (if timeframe column present)
+    combined_for_timeframe = []
+    for ftype, df in all_timeframe_data.items():
+        if df is not None and not df.empty and 'timeframe' in df.columns:
+            tmp = df[['timeframe','feature','count']].copy()
+            tmp['feature_type'] = ftype
+            combined_for_timeframe.append(tmp)
+    if combined_for_timeframe:
+        lines.append("## Timeframe Comparison (All Feature Types)")
+        combo = pd.concat(combined_for_timeframe, ignore_index=True)
+        timeframe_summary = combo.groupby('timeframe').agg(
+            Rows=('feature','count'),
+            Unique_Features=('feature','nunique'),
+            Total_Count=('count','sum')
+        ).reset_index().sort_values('timeframe')
         try:
             lines.append(timeframe_summary.to_markdown(index=False))
         except Exception as e:
-            lines.append(f"Could not render timeframe comparison: {e}")
+            lines.append(f"(Could not render timeframe comparison: {e})")
         lines.append("")
-    
-    # Detailed analysis for each timeframe (top performers)
+
+    # Top performers per timeframe (merge all feature types)
     lines.append("## Top Performers by Timeframe")
-    
-    for timeframe in TIMEFRAME_LABELS:
-        lines.append(f"### {timeframe.upper()} Timeframe")
-        
-        timeframe_files = list(PROC_DIR.glob(f'features_*_{timeframe}.parquet'))
-        if not timeframe_files:
-            lines.append("No data available for this timeframe.")
-            lines.append("")
-            continue
-        
-        # Combine data from all feature types for this timeframe
-        combined_data = []
-        for file_path in timeframe_files:
-            if 'statistical_anomalies' in file_path.name or 'emerging_terms' in file_path.name:
+    if combined_for_timeframe:
+        # We need delta_vs_mean; ensure present by recomputing if missing
+        for tf in TIMEFRAME_LABELS:
+            lines.append(f"### {tf.upper()} Timeframe")
+            tf_frames = []
+            for ftype, df in all_timeframe_data.items():
+                if df is None or df.empty:
+                    continue
+                if 'timeframe' not in df.columns:
+                    continue
+                subset = df[df['timeframe'] == tf]
+                if subset.empty:
+                    continue
+                # Ensure rolling_mean_24h & delta_vs_mean
+                if 'rolling_mean_24h' not in subset.columns or 'delta_vs_mean' not in subset.columns:
+                    subset = subset.sort_values(['feature','bin']) if 'bin' in subset.columns else subset
+                    if 'feature' in subset.columns and 'count' in subset.columns and 'bin' in subset.columns:
+                        subset['rolling_mean_24h'] = subset.groupby('feature')['count'].transform(lambda s: s.rolling(window=3, min_periods=1).mean())
+                        subset['delta_vs_mean'] = subset['count'] - subset['rolling_mean_24h']
+                subset['source_type'] = ftype
+                tf_frames.append(subset)
+            if not tf_frames:
+                lines.append("No data available for this timeframe.")
+                lines.append("")
                 continue
-            
+            merged_tf = pd.concat(tf_frames, ignore_index=True)
+            if 'bin' in merged_tf.columns and not merged_tf['bin'].empty:
+                latest_bin = merged_tf['bin'].max()
+                latest_slice = merged_tf[merged_tf['bin'] == latest_bin]
+            else:
+                latest_slice = merged_tf
+                latest_bin = 'N/A'
+            if latest_slice.empty:
+                lines.append("No latest period data.")
+                lines.append("")
+                continue
+            top = latest_slice.sort_values('delta_vs_mean', ascending=False).head(15) if 'delta_vs_mean' in latest_slice.columns else latest_slice.head(15)
+            lines.append(f"Latest period: {latest_bin}")
+            lines.append(f"Total features (latest): {len(latest_slice):,}")
             try:
-                df = pd.read_parquet(file_path)
-                if not df.empty and 'delta_vs_mean' in df.columns:
-                    feature_type = file_path.stem.split('_')[1]
-                    df['source_type'] = feature_type
-                    combined_data.append(df)
+                cols = ['source_type','feature','count','rolling_mean_24h','delta_vs_mean','category']
+                avail = [c for c in cols if c in top.columns]
+                lines.append(top[avail].to_markdown(index=False))
             except Exception as e:
-                logger.warning(f"Could not load {file_path.name}: {e}")
-        
-        if combined_data:
-            all_data = pd.concat(combined_data, ignore_index=True)
-            
-            # Get latest bin and top performers
-            if 'bin' in all_data.columns:
-                latest_bin = all_data['bin'].max()
-                latest_data = all_data[all_data['bin'] == latest_bin]
-                
-                if not latest_data.empty:
-                    top_performers = latest_data.nlargest(15, 'delta_vs_mean')
-                    
-                    lines.append(f"Latest period: {latest_bin}")
-                    lines.append(f"Total features: {len(latest_data):,}")
-                    lines.append("")
-                    lines.append("Top trending features:")
-                    
-                    try:
-                        cols = ['source_type', 'feature', 'count', 'rolling_mean_24h', 'delta_vs_mean', 'category']
-                        available_cols = [c for c in cols if c in top_performers.columns]
-                        lines.append(top_performers[available_cols].to_markdown(index=False))
-                    except Exception as e:
-                        lines.append(f"Could not render top performers table: {e}")
-        
-        lines.append("")
-    
+                lines.append(f"(Could not render top table: {e})")
+            lines.append("")
+
     # Performance insights
     lines.append("## Performance Insights")
     lines.append(f"- Processing mode: {PERFORMANCE_MODE}")
@@ -911,12 +883,179 @@ def write_enhanced_phase2_report(baseline_data: Dict[str, pd.DataFrame]):
     lines.append(f"- Caching: {'Enabled' if CONFIG['enable_caching'] else 'Disabled'}")
     lines.append(f"- Sample limit per source: {CONFIG['sample_rows_per_source']:,}" if CONFIG['sample_rows_per_source'] else "- No sampling applied")
     lines.append("")
-    
-    # Write the report
+
     with open(path, 'w', encoding='utf-8') as f:
         f.write("\n".join(lines))
-    
-    logger.info(f"Enhanced Phase 2 report written to {path}")
+    logger.info(f"Enhanced Phase 2 report written to {path} (multi-timeframe input)")
+
+# -----------------------------
+# Phase 3 Emerging Trends Reporting
+# -----------------------------
+
+def write_phase3_emerging_trends_report(emerging_df: pd.DataFrame,
+                                        hashtags_6h: pd.DataFrame,
+                                        keywords_6h: pd.DataFrame) -> None:
+    """Generate Phase 3 emerging trends report. Supports single or multi-timeframe input.
+
+    If 'timeframe' column exists, produce multi-timeframe summary & per-timeframe sections.
+    """
+    path = INTERIM_DIR / 'phase3_emerging_trends_report.md'
+    lines: List[str] = ["# Phase 3 Emerging Trends Report", ""]
+    lines.append(f"Generated: {pd.Timestamp.now():%Y-%m-%d %H:%M:%S}")
+
+    if emerging_df.empty:
+        lines.append("No emerging term data available.")
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+        logger.info(f"Phase 3 emerging trends report written to {path}")
+        return
+
+    multi_timeframe = 'timeframe' in emerging_df.columns
+
+    # Executive summary
+    lines.append("## Executive Summary")
+    total_terms = emerging_df['feature'].nunique()
+    lines.append(f"- Total unique tracked terms: {total_terms:,}")
+    if 'is_emerging' in emerging_df.columns:
+        current_mask_df = emerging_df.copy()
+        # For multi-timeframe, consider latest bin per timeframe for 'current emerging'
+        if multi_timeframe:
+            latest_per_tf = emerging_df.groupby('timeframe')['bin'].transform('max')
+            current_mask_df = emerging_df[emerging_df['bin'] == latest_per_tf]
+        else:
+            latest_bin_global = emerging_df['bin'].max()
+            current_mask_df = emerging_df[emerging_df['bin'] == latest_bin_global]
+        emerg_current = current_mask_df[current_mask_df['is_emerging'] == True]
+        lines.append(f"- Emerging terms in latest window(s): {emerg_current['feature'].nunique():,}")
+        if 'growth_rate' in emerg_current.columns and not emerg_current.empty:
+            lines.append(f"- Median growth rate (latest emerging): {emerg_current['growth_rate'].median():.2f}x")
+            lines.append(f"- Max growth rate (latest emerging): {emerg_current['growth_rate'].max():.2f}x")
+    if 'velocity' in emerging_df.columns and emerging_df['velocity'].abs().sum() > 0:
+        lines.append(f"- Mean positive velocity: {emerging_df[emerging_df['velocity']>0]['velocity'].mean():.2f}")
+    if multi_timeframe:
+        lines.append(f"- Timeframes covered: {emerging_df['timeframe'].nunique()}")
+    lines.append("")
+
+    if multi_timeframe:
+        # Per-timeframe summary table
+        lines.append("### Per-Timeframe Emerging Summary (latest window each)")
+        summ_rows = []
+        for tf in sorted(emerging_df['timeframe'].unique(), key=lambda x: TIMEFRAME_LABELS.index(x) if x in TIMEFRAME_LABELS else 999):
+            sub = emerging_df[emerging_df['timeframe']==tf]
+            latest_bin = sub['bin'].max()
+            sub_latest = sub[sub['bin']==latest_bin]
+            emerg_latest = sub_latest[sub_latest.get('is_emerging', False)==True]
+            top_term = None
+            if not emerg_latest.empty:
+                if 'growth_rate' in emerg_latest.columns:
+                    top_term = emerg_latest.sort_values('growth_rate', ascending=False)['feature'].iloc[0]
+                else:
+                    top_term = emerg_latest.sort_values('count', ascending=False)['feature'].iloc[0]
+            summ_rows.append({
+                'timeframe': tf,
+                'latest_bin': latest_bin,
+                'emerging_terms': emerg_latest['feature'].nunique(),
+                'median_growth': emerg_latest['growth_rate'].median() if 'growth_rate' in emerg_latest.columns and not emerg_latest.empty else np.nan,
+                'top_term': top_term or '-'})
+        try:
+            lines.append(pd.DataFrame(summ_rows).to_markdown(index=False))
+        except Exception as e:
+            lines.append(f"(Could not render summary table: {e})")
+        lines.append("")
+
+        # Detailed per timeframe sections
+        for tf in sorted(emerging_df['timeframe'].unique(), key=lambda x: TIMEFRAME_LABELS.index(x) if x in TIMEFRAME_LABELS else 999):
+            sub = emerging_df[emerging_df['timeframe']==tf].copy()
+            lines.append(f"## Timeframe: {tf}")
+            latest_bin = sub['bin'].max()
+            lines.append(f"Latest bin: {latest_bin}")
+            sub_latest = sub[sub['bin']==latest_bin].copy()
+            # NEW vs SUSTAINED classification within timeframe
+            appearances_tf = sub.groupby('feature')['bin'].nunique()
+            new_flags_tf = appearances_tf[appearances_tf <= 2].index
+            sub_latest['trend_type'] = np.where(sub_latest['feature'].isin(new_flags_tf), 'NEW', 'SUSTAINED')
+            # Top emerging
+            if 'growth_rate' in sub_latest.columns:
+                top_emerg = sub_latest.sort_values('growth_rate', ascending=False).head(15)
+            else:
+                top_emerg = sub_latest.sort_values('count', ascending=False).head(15)
+            lines.append("### Top Emerging (Latest Window)")
+            try:
+                cols_pref = ['trend_type','feature','category','count','prev_count','growth_rate','velocity']
+                cols = [c for c in cols_pref if c in top_emerg.columns]
+                lines.append(top_emerg[cols].to_markdown(index=False))
+            except Exception as e:
+                lines.append(f"(Could not render top table: {e})")
+            lines.append("")
+            # Category distribution
+            if 'category' in sub_latest.columns and not sub_latest.empty:
+                lines.append("#### Category Distribution (Emerging Latest Bin)")
+                cat_counts = sub_latest[sub_latest.get('is_emerging', False)==True]['category'].value_counts().reset_index()
+                cat_counts.columns = ['category','emerging_terms']
+                try:
+                    lines.append(cat_counts.to_markdown(index=False))
+                except Exception as e:
+                    lines.append(f"(Could not render category distribution: {e})")
+                lines.append("")
+            # Persistence metrics within timeframe
+            lines.append("#### Persistence")
+            persistence = appearances_tf.describe()
+            lines.append(f"- Avg bins per term: {persistence['mean']:.2f}")
+            lines.append(f"- 75th percentile bins: {persistence['75%']:.0f}")
+            if 'growth_rate' in sub.columns:
+                grp = sub.sort_values(['feature','bin']).copy()
+                grp['prev_growth'] = grp.groupby('feature')['growth_rate'].shift(1)
+                latest_join = grp[grp['bin']==latest_bin]
+                accel = latest_join[(latest_join['growth_rate'] > latest_join['prev_growth']) & (latest_join['prev_growth'].notna())]
+                decel = latest_join[(latest_join['growth_rate'] < latest_join['prev_growth']) & (latest_join['prev_growth'].notna())]
+                lines.append(f"- Accelerating: {len(accel)} | Decelerating: {len(decel)}")
+            lines.append("")
+    else:
+        # Single timeframe legacy logic
+        latest_bin = emerging_df['bin'].max()
+        lines.append(f"## Latest Window: {latest_bin}")
+        latest_slice = emerging_df[emerging_df['bin']==latest_bin].copy()
+        appearances = emerging_df.groupby('feature')['bin'].nunique()
+        new_flags = appearances[appearances <= 2].index
+        latest_slice['trend_type'] = np.where(latest_slice['feature'].isin(new_flags), 'NEW', 'SUSTAINED')
+        if 'growth_rate' in latest_slice.columns:
+            top_growth = latest_slice.sort_values('growth_rate', ascending=False).head(25)
+        else:
+            top_growth = latest_slice.sort_values('count', ascending=False).head(25)
+        lines.append("### Top Emerging Terms")
+        try:
+            cols_pref = ['trend_type','feature','category','count','prev_count','growth_rate','velocity']
+            cols = [c for c in cols_pref if c in top_growth.columns]
+            lines.append(top_growth[cols].to_markdown(index=False))
+        except Exception as e:
+            lines.append(f"(Could not render top emerging table: {e})")
+        lines.append("")
+
+    # Overlap with baseline (still useful context)
+    lines.append("## Overlap With Baseline 6h Aggregates")
+    def overlap_section(label: str, base_df: pd.DataFrame):
+        if base_df is None or base_df.empty or emerging_df.empty:
+            return f"- {label}: No data"
+        # Use 6h subset if multi-timeframe present
+        if 'timeframe' in emerging_df.columns:
+            e6 = emerging_df[emerging_df['timeframe']=='6h']
+            if e6.empty:
+                return f"- {label}: No 6h emerging data"
+            latest_bin_loc = e6['bin'].max()
+            emerg_latest = set(e6[e6['bin']==latest_bin_loc]['feature'])
+        else:
+            latest_bin_loc = emerging_df['bin'].max()
+            emerg_latest = set(emerging_df[emerging_df['bin']==latest_bin_loc]['feature'])
+        base_latest = set(base_df[base_df['bin']==base_df['bin'].max()]['feature']) if 'bin' in base_df.columns else set()
+        inter = emerg_latest & base_latest
+        return (f"- {label}: overlap {len(inter)} ({len(inter)/max(1,len(emerg_latest))*100:.1f}% of latest emerging)")
+    lines.append(overlap_section('Hashtags 6h', hashtags_6h))
+    lines.append(overlap_section('Keywords 6h', keywords_6h))
+    lines.append("")
+
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+    logger.info(f"Phase 3 emerging trends report written to {path}")
 
 # -----------------------------
 # Main Optimized Pipeline
@@ -1019,26 +1158,60 @@ def main_optimized():
                 k_combined.to_parquet(PROC_DIR / k_file, index=False)
                 logger.info(f"Saved {k_file}: {len(k_combined):,} rows")
     
-    # Enhanced Phase 2 report
-    baseline_data = {
-        'hashtags': ts_hashtags,
-        'keywords': ts_keywords,
-        'audio': ts_audio
+    # Build combined multi-timeframe datasets for report (include 6h inside each)
+    def load_all_timeframes(feature_type: str) -> pd.DataFrame:
+        frames: List[pd.DataFrame] = []
+        for pth in PROC_DIR.glob(f'features_{feature_type}_*.parquet'):
+            if 'emerging_terms' in pth.name or 'statistical_anomalies' in pth.name:
+                continue
+            try:
+                dfp = pd.read_parquet(pth)
+                if dfp.empty:
+                    continue
+                tf_label = pth.stem.split('_')[-1]
+                dfp = dfp.copy()
+                dfp['timeframe'] = tf_label
+                frames.append(dfp)
+            except Exception as e:
+                logger.warning(f"Failed loading {pth.name} for report merge: {e}")
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    all_timeframe_data = {
+        'hashtags': load_all_timeframes('hashtags'),
+        'keywords': load_all_timeframes('keywords'),
+        'audio': load_all_timeframes('audio')  # may be empty
     }
-    write_enhanced_phase2_report(baseline_data)
+    write_enhanced_phase2_report(all_timeframe_data)
     
-    # Phase 3: Optimized emerging trends detection
-    logger.info("Phase 3: Running optimized emerging trends detection")
-    
-    emerging_file = 'features_emerging_terms_6h.parquet'
-    if not (PROC_DIR / emerging_file).exists():
-        ts_emerging = aggregate_emerging_terms_optimized(all_sources, '6h', min_growth_rate=2.5)
-        if not ts_emerging.empty:
-            ts_emerging.to_parquet(PROC_DIR / emerging_file, index=False)
-            logger.info(f"Saved emerging terms: {len(ts_emerging):,} rows")
+    # Phase 3: Multi-timeframe emerging trends detection
+    logger.info("Phase 3: Running multi-timeframe emerging trends detection")
+    emerging_frames = []
+    for label in TIMEFRAME_LABELS:
+        # Use growth rate threshold per timeframe
+        growth_thr = MIN_GROWTH_RATE_BY_LABEL.get(label, 2.0)
+        fname = PROC_DIR / f'features_emerging_terms_{label}.parquet'
+        if fname.exists():
+            df_em = pd.read_parquet(fname)
+            logger.info(f"Loaded existing emerging terms {label}: {len(df_em):,} rows")
+        else:
+            df_em = aggregate_emerging_terms_optimized(all_sources, label, min_growth_rate=growth_thr)
+            if not df_em.empty:
+                df_em.to_parquet(fname, index=False)
+                logger.info(f"Saved emerging terms {label}: {len(df_em):,} rows (thr={growth_thr})")
+        if not df_em.empty:
+            df_em = df_em.copy()
+            df_em['timeframe'] = label
+            emerging_frames.append(df_em)
+    if emerging_frames:
+        ts_emerging_multi = pd.concat(emerging_frames, ignore_index=True)
     else:
-        ts_emerging = pd.read_parquet(PROC_DIR / emerging_file)
-        logger.info(f"Loaded existing emerging terms: {len(ts_emerging):,} rows")
+        ts_emerging_multi = pd.DataFrame()
+
+    # Write Phase 3 emerging trends report (multi timeframe aware)
+    try:
+        write_phase3_emerging_trends_report(ts_emerging_multi, ts_hashtags, ts_keywords)
+    except Exception as e:
+        logger.warning(f"Failed to write Phase 3 emerging trends report: {e}")
     
     # Performance summary
     end_time = time.time()
