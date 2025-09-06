@@ -10,9 +10,28 @@ from scipy import stats
 import warnings
 warnings.filterwarnings('ignore')
 
+# -----------------------------
+# Performance / Fast Mode Controls
+# -----------------------------
+FAST_MODE = True                 # Global switch to reduce computation cost
+MAX_FEATURES_EMERGING = 400      # Cap emerging term features per timeframe
+MAX_FEATURES_ANOMALY = 400       # Cap features for statistical anomaly scan
+MAX_CLUSTER_FEATURES = 250       # Cap features for clustering
+COMPUTE_VELOCITY = False if FAST_MODE else True  # Skip velocity in fast mode (except 6h primary)
+SAMPLE_ROWS_PER_SOURCE = 150_000 # If a raw text source exceeds this, sample rows
+
+from itertools import combinations
+
+# Optional heavy audio feature extraction (graceful fallback)
+try:
+    import librosa  # type: ignore
+    HAS_LIBROSA = True
+except Exception:
+    HAS_LIBROSA = False
+
 ROOT = Path(__file__).resolve().parents[1]
 RAW_DIR = ROOT / "data" / "raw"
-PROC_DIR = ROOT / "data" / "processed"
+PROC_DIR = ROOT / "data" / "processed" / "dataset"
 INTERIM_DIR = ROOT / "data" / "interim"
 CACHE_DIR = ROOT / "data" / "cache"
 
@@ -369,8 +388,11 @@ def calculate_term_velocity(term_counts: pd.DataFrame, term: str, window_hours: 
 def detect_statistical_anomalies(term_counts: pd.DataFrame, z_threshold: float = 2.5) -> pd.DataFrame:
     """Detect statistically anomalous spikes in term frequency."""
     anomalies = []
-    
-    for term in term_counts['feature'].unique():
+    features = term_counts['feature'].unique()
+    # Fast mode cap
+    if FAST_MODE and len(features) > MAX_FEATURES_ANOMALY:
+        features = features[:MAX_FEATURES_ANOMALY]
+    for term in features:
         term_data = term_counts[term_counts['feature'] == term].sort_values('bin')
         
         if len(term_data) < 5:  # Need enough data points
@@ -419,6 +441,8 @@ def aggregate_emerging_terms_6h(dfs: List[Tuple[str, pd.DataFrame]],
     print("[Phase3] Extracting all terms from text data...")
     
     for name, df in tqdm(dfs, desc="Processing emerging terms", unit="src"):
+        if FAST_MODE and len(df) > SAMPLE_ROWS_PER_SOURCE:
+            df = df.sample(SAMPLE_ROWS_PER_SOURCE, random_state=42)
         p = _prepare_text_df(df)
         if p is None or p.empty:
             continue
@@ -451,186 +475,156 @@ def aggregate_emerging_terms_6h(dfs: List[Tuple[str, pd.DataFrame]],
     if allg.empty:
         return pd.DataFrame(columns=["bin", "feature", "count", "growth_rate", "is_emerging"])
     
-    # Calculate growth rates
+    # Calculate growth rates (vectorized)
     allg = allg.sort_values(["feature", "bin"]).reset_index(drop=True)
-    
-    def calc_growth_rate(group):
-        if len(group) < 2:
-            group["growth_rate"] = 0.0
-            return group
-        
-        # Calculate percentage change
-        group = group.sort_values("bin")
-        group["prev_count"] = group["count"].shift(1)
-        group["growth_rate"] = group["count"] / (group["prev_count"] + 1e-6)  # Add small epsilon
-        group["growth_rate"] = group["growth_rate"].fillna(1.0)
-        return group
-    
-    allg = allg.groupby("feature").apply(calc_growth_rate).reset_index(drop=True)
+    allg['prev_count'] = allg.groupby('feature')['count'].shift(1)
+    allg['growth_rate'] = allg['count'] / (allg['prev_count'] + 1e-6)
+    allg.loc[allg['prev_count'].isna(), 'growth_rate'] = 1.0
     
     # Identify emerging terms (high recent growth)
     allg["is_emerging"] = allg["growth_rate"] >= min_growth_rate
     allg["category"] = allg["feature"].map(categorize_feature)
     
     # Add velocity calculations
-    print("[Phase3] Calculating term velocities...")
-    velocities = {}
-    for term in tqdm(allg["feature"].unique(), desc="Computing velocities"):
-        velocities[term] = calculate_term_velocity(allg, term)
-    
-    allg["velocity"] = allg["feature"].map(velocities)
+    if COMPUTE_VELOCITY:
+        print("[Phase3] Calculating term velocities...")
+        velocities = {}
+        for term in tqdm(allg["feature"].unique(), desc="Computing velocities"):
+            velocities[term] = calculate_term_velocity(allg, term)
+        allg["velocity"] = allg["feature"].map(velocities)
+    else:
+        allg["velocity"] = 0.0
     
     # Cache results
     save_cache(cache_key, {"data": allg.to_dict(), "timestamp": pd.Timestamp.now()})
     
     return allg
 
+# -- Inserted: generic emerging terms timeframe function --
 
-def identify_trend_clusters(emerging_df: pd.DataFrame, 
-                          similarity_threshold: float = 0.7) -> pd.DataFrame:
-    """Group similar emerging terms into trend clusters."""
-    if emerging_df.empty:
-        return pd.DataFrame(columns=["cluster_id", "terms", "cluster_size", "avg_velocity"])
-    
-    # Get emerging terms
-    emerging_terms = emerging_df[emerging_df["is_emerging"] == True]["feature"].unique()
-    
-    if len(emerging_terms) == 0:
-        return pd.DataFrame(columns=["cluster_id", "terms", "cluster_size", "avg_velocity"])
-    
-    # Simple clustering based on word overlap
-    clusters = []
-    used_terms = set()
-    
-    for term in emerging_terms:
-        if term in used_terms:
-            continue
-        
-        # Start a new cluster
-        cluster_terms = [term]
-        used_terms.add(term)
-        term_words = set(term.lower().split())
-        
-        # Find similar terms
-        for other_term in emerging_terms:
-            if other_term in used_terms:
-                continue
-            
-            other_words = set(other_term.lower().split())
-            
-            # Calculate Jaccard similarity
-            intersection = len(term_words.intersection(other_words))
-            union = len(term_words.union(other_words))
-            
-            if union > 0 and intersection / union >= similarity_threshold:
-                cluster_terms.append(other_term)
-                used_terms.add(other_term)
-        
-        if len(cluster_terms) >= 1:  # Include single-term clusters
-            # Calculate average velocity for cluster
-            cluster_velocities = []
-            for ct in cluster_terms:
-                term_velocity = emerging_df[emerging_df["feature"] == ct]["velocity"].mean()
-                if not pd.isna(term_velocity):
-                    cluster_velocities.append(term_velocity)
-            
-            avg_velocity = np.mean(cluster_velocities) if cluster_velocities else 0.0
-            
-            clusters.append({
-                "cluster_id": len(clusters),
-                "terms": cluster_terms,
-                "cluster_size": len(cluster_terms),
-                "avg_velocity": avg_velocity
-            })
-    
-    return pd.DataFrame(clusters)
-
-
-def aggregate_hashtags_6h(dfs: List[Tuple[str, pd.DataFrame]]) -> pd.DataFrame:
+def aggregate_emerging_terms_timeframe(dfs: List[Tuple[str, pd.DataFrame]], label: str,
+                                       min_growth_rate: float = 2.0) -> pd.DataFrame:
+    if label == '6h':
+        return aggregate_emerging_terms_6h(dfs, min_frequency=_MIN_FREQ_BY_LABEL.get(label, 3), min_growth_rate=min_growth_rate)
+    min_frequency = _MIN_FREQ_BY_LABEL.get(label, 5)
     frames = []
-    for name, df in tqdm(dfs, desc="Aggregating hashtags", unit="src"):
+    print(f"[Phase3][Emerging:{label}] Extracting all terms...")
+    for name, df in tqdm(dfs, desc=f"Emerging terms {label}", unit="src"):
+        if FAST_MODE and len(df) > SAMPLE_ROWS_PER_SOURCE:
+            df = df.sample(SAMPLE_ROWS_PER_SOURCE, random_state=42)
         p = _prepare_text_df(df)
         if p is None or p.empty:
             continue
-        # explode hashtags
-        pe = p[["ts", "hashtags"]].explode("hashtags")
-        pe = pe.dropna(subset=["hashtags"])  # remove rows without hashtags
-        pe["bin"] = pe["ts"].dt.floor('6h')
-        g = pe.groupby(["bin", "hashtags"], as_index=False).size().rename(columns={"size": "count"})
-        g = g.rename(columns={"hashtags": "feature"})
-        g["category"] = g["feature"].map(categorize_feature)
+        p['all_terms'] = p['text_clean'].map(extract_all_terms)
+        p['bin'] = _assign_time_bin(p['ts'], label)
+        pe = p[['bin','all_terms']].explode('all_terms').dropna(subset=['all_terms'])
+        if pe.empty:
+            continue
+        pe = pe.rename(columns={'all_terms':'feature'})
+        g = pe.groupby(['bin','feature'], as_index=False).size().rename(columns={'size':'count'})
         frames.append(g)
     if not frames:
-        return pd.DataFrame(columns=["bin", "feature", "count", "rolling_mean_24h", "delta_vs_mean"])
+        return pd.DataFrame(columns=["bin","feature","count","growth_rate","is_emerging","velocity","category"])    
     allg = pd.concat(frames, ignore_index=True)
-    allg = allg.groupby(["bin", "feature", "category"], as_index=False)["count"].sum()
-    # rolling per feature across time
-    allg = allg.sort_values(["feature", "bin"]).reset_index(drop=True)
-    allg["rolling_mean_24h"] = (
-        allg.groupby("feature")["count"].transform(lambda s: s.rolling(window=4, min_periods=1).mean())
-    )
-    allg["delta_vs_mean"] = allg["count"] - allg["rolling_mean_24h"]
-    return allg
-
-
-def aggregate_keywords_6h(dfs: List[Tuple[str, pd.DataFrame]]) -> pd.DataFrame:
-    frames = []
-    kw_patterns = [(kw, re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE)) for kw in KEYWORDS]
-    for name, df in tqdm(dfs, desc="Aggregating keywords", unit="src"):
-        p = _prepare_text_df(df)
-        if p is None or p.empty:
-            continue
-        p["bin"] = p["ts"].dt.floor('6h')
-        for kw, pat in kw_patterns:
-            mask = p["text_clean"].str.contains(pat)
-            g = p.loc[mask].groupby("bin", as_index=False).size().rename(columns={"size": "count"})
-            g["feature"] = kw
-            g["category"] = categorize_feature(kw)
-            frames.append(g)
-    if not frames:
-        return pd.DataFrame(columns=["bin", "feature", "count", "rolling_mean_24h", "delta_vs_mean"])
-    allg = pd.concat(frames, ignore_index=True)
-    allg = allg.groupby(["bin", "feature", "category"], as_index=False)["count"].sum()
-    allg = allg.sort_values(["feature", "bin"]).reset_index(drop=True)
-    allg["rolling_mean_24h"] = (
-        allg.groupby("feature")["count"].transform(lambda s: s.rolling(window=4, min_periods=1).mean())
-    )
-    allg["delta_vs_mean"] = allg["count"] - allg["rolling_mean_24h"]
-    return allg
-
-
-def aggregate_audio_6h(dfs: List[Tuple[str, pd.DataFrame]]) -> pd.DataFrame:
-    frames: List[pd.DataFrame] = []
-    for name, df in tqdm(dfs, desc="Aggregating audio", unit="src"):
-        ts_col = find_timestamp_column(df)
-        audio_col = find_audio_column(df)
-        if not ts_col or not audio_col:
-            continue
-        use = df[[ts_col, audio_col]].copy()
-        use["ts"] = pd.to_datetime(use[ts_col], errors='coerce')
-        use = use.dropna(subset=["ts", audio_col])
-        if use.empty:
-            continue
-        use["bin"] = use["ts"].dt.floor('6h')
-        g = use.groupby(["bin", audio_col], as_index=False).size().rename(columns={"size": "count"})
-        g = g.rename(columns={audio_col: "feature"})
-        g["category"] = "Other"
-        frames.append(g)
-    if not frames:
-        return pd.DataFrame(columns=["bin", "feature", "count", "rolling_mean_24h", "delta_vs_mean"])
-    allg = pd.concat(frames, ignore_index=True)
-    allg = allg.groupby(["bin", "feature", "category"], as_index=False)["count"].sum()
-    allg = allg.sort_values(["feature", "bin"]).reset_index(drop=True)
-    allg["rolling_mean_24h"] = (
-        allg.groupby("feature")["count"].transform(lambda s: s.rolling(window=4, min_periods=1).mean())
-    )
-    allg["delta_vs_mean"] = allg["count"] - allg["rolling_mean_24h"]
+    allg = allg.groupby(['bin','feature'], as_index=False)['count'].sum()
+    total_counts = allg.groupby('feature')['count'].sum()
+    frequent = total_counts[total_counts >= min_frequency].index
+    allg = allg[allg['feature'].isin(frequent)]
+    if allg.empty:
+        return pd.DataFrame(columns=["bin","feature","count","growth_rate","is_emerging","velocity","category"])    
+    allg = allg.sort_values(['feature','bin']).reset_index(drop=True)
+    allg['prev_count'] = allg.groupby('feature')['count'].shift(1)
+    allg['growth_rate'] = allg['count'] / (allg['prev_count'] + 1e-6)
+    allg.loc[allg['prev_count'].isna(), 'growth_rate'] = 1.0
+    allg['is_emerging'] = allg['growth_rate'] >= min_growth_rate
+    allg['category'] = allg['feature'].map(categorize_feature)
+    if COMPUTE_VELOCITY and label == '6h':
+        print(f"[Phase3][Emerging:{label}] Calculating velocities...")
+        velocities = {}
+        for term in allg['feature'].unique():
+            velocities[term] = calculate_term_velocity(allg, term, window_hours=24)
+        allg['velocity'] = allg['feature'].map(velocities)
+    else:
+        allg['velocity'] = 0.0
     return allg
 
 
 # -----------------------------
 # Multi-timeframe aggregation extensions
 # -----------------------------
+
+# ---- 6h baseline aggregation helpers (previously assumed but not defined) ----
+
+def _aggregate_baseline(df_pairs: List[Tuple[str, pd.DataFrame]], kind: str) -> pd.DataFrame:
+    frames: List[pd.DataFrame] = []
+    if kind == 'hashtags' or kind == 'keywords':
+        kw_patterns = None
+        if kind == 'keywords':
+            kw_patterns = [(kw, re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE)) for kw in KEYWORDS]
+    for name, df in tqdm(df_pairs, desc=f"Aggregating {kind} (6h)", unit="src"):
+        if kind in ('hashtags', 'keywords'):
+            p = _prepare_text_df(df)
+            if p is None or p.empty:
+                continue
+            p['bin'] = p['ts'].dt.floor('6H')
+            if kind == 'hashtags':
+                pe = p[['bin','hashtags']].explode('hashtags').dropna(subset=['hashtags'])
+                if pe.empty:
+                    continue
+                g = pe.groupby(['bin','hashtags'], as_index=False).size().rename(columns={'size':'count'})
+                g = g.rename(columns={'hashtags':'feature'})
+                g['category'] = g['feature'].map(categorize_feature)
+                frames.append(g)
+            else:  # keywords
+                for kw, pat in kw_patterns:  # type: ignore
+                    mask = p['text_clean'].str.contains(pat)
+                    if not mask.any():
+                        continue
+                    g = p.loc[mask].groupby('bin', as_index=False).size().rename(columns={'size':'count'})
+                    g['feature'] = kw
+                    g['category'] = categorize_feature(kw)
+                    frames.append(g)
+        elif kind == 'audio':
+            ts_col = find_timestamp_column(df)
+            audio_col = find_audio_column(df)
+            if not ts_col or not audio_col:
+                continue
+            use = df[[ts_col, audio_col]].copy()
+            use['ts'] = pd.to_datetime(use[ts_col], errors='coerce')
+            use = use.dropna(subset=['ts', audio_col])
+            if use.empty:
+                continue
+            use['bin'] = use['ts'].dt.floor('6H')
+            g = use.groupby(['bin', audio_col], as_index=False).size().rename(columns={'size':'count'})
+            g = g.rename(columns={audio_col:'feature'})
+            # Attempt optional audio feature extraction summarization
+            g['category'] = 'Other'
+            frames.append(g)
+    if not frames:
+        return pd.DataFrame(columns=['bin','feature','count','rolling_mean_24h','delta_vs_mean','category'])
+    allg = pd.concat(frames, ignore_index=True)
+    if kind != 'keywords':  # keywords already have category assignment
+        # Ensure category present
+        if 'category' not in allg.columns:
+            allg['category'] = allg['feature'].map(categorize_feature)
+    allg = allg.groupby(['bin','feature','category'], as_index=False)['count'].sum()
+    # Rolling stats (24h == 4 * 6h)
+    allg = allg.sort_values(['feature','bin']).reset_index(drop=True)
+    allg['rolling_mean_24h'] = allg.groupby('feature')['count'].transform(lambda s: s.rolling(window=4, min_periods=1).mean())
+    allg['delta_vs_mean'] = allg['count'] - allg['rolling_mean_24h']
+    return allg
+
+
+def aggregate_hashtags_6h(dfs: List[Tuple[str,pd.DataFrame]]) -> pd.DataFrame:
+    return _aggregate_baseline(dfs, 'hashtags')
+
+
+def aggregate_keywords_6h(dfs: List[Tuple[str,pd.DataFrame]]) -> pd.DataFrame:
+    return _aggregate_baseline(dfs, 'keywords')
+
+
+def aggregate_audio_6h(dfs: List[Tuple[str,pd.DataFrame]]) -> pd.DataFrame:
+    return _aggregate_baseline(dfs, 'audio')
 
 TIMEFRAME_LABELS = [
     '1h','3h','6h','1d','3d','7d','14d','1m','3m','6m'
@@ -659,6 +653,20 @@ _ROLLING_WINDOW = {
     '1m': 6,    # past 6 months
     '3m': 4,    # past year
     '6m': 4     # past 2 years
+}
+
+# Minimum frequency thresholds per timeframe for emerging term filtering
+_MIN_FREQ_BY_LABEL = {
+    '1h': 3,
+    '3h': 3,
+    '6h': 3,
+    '1d': 5,
+    '3d': 5,
+    '7d': 8,
+    '14d': 10,
+    '1m': 15,
+    '3m': 20,
+    '6m': 30
 }
 
 def _assign_time_bin(ts: pd.Series, label: str) -> pd.Series:
@@ -691,6 +699,8 @@ def aggregate_hashtags_timeframe(dfs: List[Tuple[str,pd.DataFrame]], label: str)
         return aggregate_hashtags_6h(dfs)
     frames = []
     for name, df in tqdm(dfs, desc=f"Aggregating hashtags ({label})", unit="src"):
+        if FAST_MODE and len(df) > SAMPLE_ROWS_PER_SOURCE:
+            df = df.sample(SAMPLE_ROWS_PER_SOURCE, random_state=42)
         p = _prepare_text_df(df)
         if p is None or p.empty:
             continue
@@ -715,6 +725,8 @@ def aggregate_keywords_timeframe(dfs: List[Tuple[str,pd.DataFrame]], label: str)
     frames = []
     kw_patterns = [(kw, re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE)) for kw in KEYWORDS]
     for name, df in tqdm(dfs, desc=f"Aggregating keywords ({label})", unit="src"):
+        if FAST_MODE and len(df) > SAMPLE_ROWS_PER_SOURCE:
+            df = df.sample(SAMPLE_ROWS_PER_SOURCE, random_state=42)
         p = _prepare_text_df(df)
         if p is None or p.empty:
             continue
@@ -739,6 +751,8 @@ def aggregate_audio_timeframe(dfs: List[Tuple[str,pd.DataFrame]], label: str) ->
         return aggregate_audio_6h(dfs)
     frames: List[pd.DataFrame] = []
     for name, df in tqdm(dfs, desc=f"Aggregating audio ({label})", unit="src"):
+        if FAST_MODE and len(df) > SAMPLE_ROWS_PER_SOURCE:
+            df = df.sample(SAMPLE_ROWS_PER_SOURCE, random_state=42)
         ts_col = find_timestamp_column(df)
         audio_col = find_audio_column(df)
         if not ts_col or not audio_col:
@@ -896,19 +910,36 @@ def write_phase3_report(emerging_df: pd.DataFrame, anomalies_df: pd.DataFrame, c
 def write_phase2_report(h_df: pd.DataFrame, k_df: pd.DataFrame, a_df: pd.DataFrame):
     path = INTERIM_DIR / 'phase2_features_report.md'
     lines = ["# Phase 2 Feature Engineering Report", ""]
-    # Overall counts
-    lines.append("## Summary")
-    lines.append(f"- Hashtag rows: {len(h_df)}")
-    lines.append(f"- Keyword rows: {len(k_df)}")
-    lines.append(f"- Audio rows: {len(a_df)}")
+    lines.append("## Summary (6h baseline)")
+    lines.append(f"- Hashtag rows (6h): {len(h_df)}")
+    lines.append(f"- Keyword rows (6h): {len(k_df)}")
+    lines.append(f"- Audio rows (6h): {len(a_df)}")
     lines.append("")
-    for label, df in [("Hashtags", h_df), ("Keywords", k_df), ("Audio", a_df)]:
+    # Multi-frequency inventory
+    inventory = []
+    for p in PROC_DIR.glob('features_*.parquet'):
+        if 'statistical_anomalies' in p.name or 'emerging_terms' in p.name:
+            continue
+        try:
+            dfp = pd.read_parquet(p)
+            label = p.stem.split('_')[-1]
+            inventory.append({'file': p.name, 'rows': len(dfp), 'timeframe': label})
+        except Exception:
+            continue
+    if inventory:
+        lines.append("## Multi-Frequency Inventory")
+        inv_df = pd.DataFrame(inventory).sort_values(['timeframe','file'])
+        try:
+            lines.append(inv_df.to_markdown(index=False))
+        except Exception as e:
+            lines.append(f"(Could not render inventory: {e})")
+        lines.append("")
+    for label, df in [("Hashtags (6h)", h_df), ("Keywords (6h)", k_df), ("Audio (6h)", a_df)]:
         lines.append(f"## {label}")
         if df.empty:
             lines.append("No data available.")
             lines.append("")
             continue
-        # Latest window top anomalies by delta_vs_mean
         latest_bin = df['bin'].max()
         latest = df[df['bin'] == latest_bin].sort_values('delta_vs_mean', ascending=False).head(15)
         try:
@@ -918,35 +949,100 @@ def write_phase2_report(h_df: pd.DataFrame, k_df: pd.DataFrame, a_df: pd.DataFra
         except Exception as e:
             lines.append(f"(Could not render table: {e})")
         lines.append("")
-        # Last 7 days (if available)
-        try:
-            start_7d = latest_bin - pd.Timedelta(days=7)
-            last7 = df[(df['bin'] >= start_7d) & (df['bin'] <= latest_bin)]
-            if not last7.empty:
-                top7 = last7.groupby(['feature', 'category'], as_index=False)['count'].sum().sort_values('count', ascending=False).head(15)
-                lines.append("Top features in last 7 days:")
-                lines.append(top7.to_markdown(index=False))
-                lines.append("")
-        except Exception as e:
-            lines.append(f"(Could not render last-7-days table: {e})")
-    # Category-level summary for latest bin across all sources
-    lines.append("## Category summary (latest bin)")
-    latest_rows = []
-    for df in [h_df, k_df, a_df]:
-        if df.empty:
-            continue
-        lb = df['bin'].max()
-        latest_rows.append(df[df['bin'] == lb])
-    if latest_rows:
-        latest_all = pd.concat(latest_rows, ignore_index=True)
-        try:
-            cat_summary = latest_all.groupby('category', as_index=False)['count'].sum().sort_values('count', ascending=False)
-            lines.append(cat_summary.to_markdown(index=False))
-        except Exception as e:
-            lines.append(f"(Could not render category summary: {e})")
     with open(path, 'w', encoding='utf-8') as f:
         f.write("\n".join(lines))
     print(f"Report written to {path}")
+
+def build_trend_candidate_table():
+    patterns = ["features_hashtags_*.parquet", "features_keywords_*.parquet"]
+    rows = []
+    for pat in patterns:
+        for p in PROC_DIR.glob(pat):
+            try:
+                dfp = pd.read_parquet(p)
+                if dfp.empty:
+                    continue
+                freq = p.stem.split('_')[-1]
+                dfp = dfp.copy()
+                if 'bin' in dfp.columns:
+                    dfp['bin'] = pd.to_datetime(dfp['bin'])
+                dfp = dfp.sort_values(['feature','bin'])
+                if 'rolling_mean_24h' not in dfp.columns:
+                    dfp['rolling_mean_24h'] = dfp.groupby('feature')['count'].transform(lambda s: s.rolling(window=3, min_periods=1).mean())
+                dfp['delta_vs_mean'] = dfp['count'] - dfp['rolling_mean_24h']
+                dfp['rate_of_change'] = dfp.groupby('feature')['count'].pct_change().replace([np.inf,-np.inf],0).fillna(0)
+                dfp['frequency'] = freq
+                rows.append(dfp[['bin','feature','count','rolling_mean_24h','delta_vs_mean','rate_of_change','category','frequency']])
+            except Exception as e:
+                print(f"[WARN] Skipping trend candidate build for {p.name}: {e}")
+    if rows:
+        master = pd.concat(rows, ignore_index=True)
+        write_parquet(master, 'trend_candidates_master.parquet', force=True)
+        print(f"[Phase3-FAST] Trend candidate master rows: {len(master)}")
+    else:
+        print("[Phase3-FAST] No trend candidates built.")
+
+
+# -----------------------------
+# Trend clustering (Phase 3 support) — simple Jaccard-based union-find
+# -----------------------------
+
+def identify_trend_clusters(emerging_df: pd.DataFrame, similarity_threshold: float = 0.6) -> pd.DataFrame:
+    """Cluster terms using Jaccard similarity over token sets.
+
+    Args:
+        emerging_df: DataFrame with at least 'feature', optionally 'velocity'.
+        similarity_threshold: Jaccard threshold to join clusters.
+    Returns:
+        DataFrame with cluster_id, terms list, cluster_size, avg_velocity.
+    """
+    if emerging_df is None or emerging_df.empty or 'feature' not in emerging_df.columns:
+        return pd.DataFrame(columns=['cluster_id','terms','cluster_size','avg_velocity'])
+
+    features = sorted(emerging_df['feature'].unique())
+    token_map: Dict[str, Set[str]] = {f: set(re.findall(r"[a-zA-Z0-9]+", f.lower())) for f in features}
+
+    # Union-Find structure
+    parent = {f: f for f in features}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for f1, f2 in combinations(features, 2):
+        t1, t2 = token_map[f1], token_map[f2]
+        if not t1 or not t2:
+            continue
+        inter = len(t1 & t2)
+        if inter == 0:
+            continue
+        jacc = inter / len(t1 | t2)
+        if jacc >= similarity_threshold:
+            union(f1, f2)
+
+    # Group clusters
+    clusters: Dict[str, List[str]] = defaultdict(list)
+    for f in features:
+        clusters[find(f)].append(f)
+
+    records = []
+    velocity_map = emerging_df.set_index('feature')['velocity'].to_dict() if 'velocity' in emerging_df.columns else {}
+    for cid, terms in enumerate(clusters.values()):
+        avg_vel = float(np.nanmean([velocity_map.get(t, np.nan) for t in terms])) if velocity_map else np.nan
+        records.append({
+            'cluster_id': cid,
+            'terms': terms,
+            'cluster_size': len(terms),
+            'avg_velocity': avg_vel
+        })
+    return pd.DataFrame(records).sort_values('cluster_size', ascending=False).reset_index(drop=True)
 
 
 def main():
@@ -970,69 +1066,72 @@ def main():
     write_parquet(ts_audio, 'features_audio_6h.parquet')
 
     # Extended multi-timeframe aggregations
-    print("[Phase2] Multi-timeframe aggregations starting...")
+    print("[Phase2] Multi-timeframe aggregations starting (all sources)...")
+    all_sources = list(samples.items())
     for label in TIMEFRAME_LABELS:
         if label == '6h':
-            continue  # already done
+            continue
         try:
             h_name = f'features_hashtags_{label}.parquet'
             k_name = f'features_keywords_{label}.parquet'
             a_name = f'features_audio_{label}.parquet'
-            
-            # Check if files already exist before computing
             if not check_parquet_exists(h_name):
-                h_tf = aggregate_hashtags_timeframe(text_sources, label)
+                h_tf = aggregate_hashtags_timeframe(all_sources, label)
                 if not h_tf.empty:
                     write_parquet(h_tf, h_name)
-            
             if not check_parquet_exists(k_name):
-                k_tf = aggregate_keywords_timeframe(text_sources, label)
+                k_tf = aggregate_keywords_timeframe(all_sources, label)
                 if not k_tf.empty:
                     write_parquet(k_tf, k_name)
-            
             if not check_parquet_exists(a_name):
-                a_tf = aggregate_audio_timeframe(text_sources, label)
+                a_tf = aggregate_audio_timeframe(all_sources, label)
                 if not a_tf.empty:
                     write_parquet(a_tf, a_name)
-                    
         except Exception as e:
             print(f"[WARN] Failed timeframe aggregation {label}: {e}")
-    print("[Phase2] Multi-timeframe aggregations completed.")
+    print("[Phase2] Multi-timeframe aggregations completed (all sources).")
 
     write_phase2_report(ts_hashtags, ts_keywords, ts_audio)
     
-    # Phase 3: Advanced Trend Detection
-    print("\n[Phase3] Starting advanced trend detection...")
-    
-    # Emerging terms detection (keyword-independent)
-    print("[Phase3] Detecting emerging terms...")
-    ts_emerging = aggregate_emerging_terms_6h(text_sources, min_frequency=3, min_growth_rate=2.0)
-    
-    # Statistical anomaly detection
-    print("[Phase3] Detecting statistical anomalies...")
-    all_traditional_features = pd.concat([ts_hashtags, ts_keywords], ignore_index=True)
-    ts_anomalies = detect_statistical_anomalies(all_traditional_features, z_threshold=2.5)
-    
-    # Trend clustering
-    print("[Phase3] Clustering related trends...")
-    ts_clusters = identify_trend_clusters(ts_emerging, similarity_threshold=0.6)
-    
-    # Save Phase 3 outputs
+    # Phase 3 FAST simplified trend detection
+    print("\n[Phase3-FAST] Starting simplified trend detection...")
+    ts_emerging = aggregate_emerging_terms_6h(all_sources, min_frequency=5, min_growth_rate=2.5)
+    if FAST_MODE and len(ts_emerging) > MAX_FEATURES_EMERGING:
+        ts_emerging = ts_emerging.sort_values('count', ascending=False).head(MAX_FEATURES_EMERGING)
+    all_traditional = pd.concat([ts_hashtags, ts_keywords], ignore_index=True)
+    if FAST_MODE:
+        # keep top features by total count
+        top_feats = all_traditional.groupby('feature')['count'].sum().sort_values(ascending=False).head(MAX_FEATURES_ANOMALY).index
+        all_traditional = all_traditional[all_traditional['feature'].isin(top_feats)]
+    ts_anomalies = detect_statistical_anomalies(all_traditional, z_threshold=3.0 if FAST_MODE else 2.5)
+    # Simple cluster grouping by first token prefix
+    def simple_cluster(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame(columns=['cluster_id','terms','cluster_size','avg_velocity'])
+        groups = defaultdict(list)
+        for term in df['feature'].unique():
+            key = term.split()[0][:5].lower()
+            groups[key].append(term)
+        rows = []
+        cid = 0
+        for k, feats in groups.items():
+            rows.append({'cluster_id': cid, 'terms': feats, 'cluster_size': len(feats), 'avg_velocity': float(df[df['feature'].isin(feats)]['velocity'].mean() if 'velocity' in df.columns else 0.0)})
+            cid += 1
+        return pd.DataFrame(rows)
+    ts_clusters = simple_cluster(ts_emerging)
     if not check_parquet_exists('features_emerging_terms_6h.parquet'):
         write_parquet(ts_emerging, 'features_emerging_terms_6h.parquet')
     if not ts_anomalies.empty and not check_parquet_exists('features_statistical_anomalies.parquet'):
         write_parquet(ts_anomalies, 'features_statistical_anomalies.parquet')
     if not ts_clusters.empty and not check_parquet_exists('trend_clusters.parquet'):
         write_parquet(ts_clusters, 'trend_clusters.parquet')
-    
-    # Generate comprehensive Phase 3 report
     write_phase3_report(ts_emerging, ts_anomalies, ts_clusters)
-    
-    print("[Phase3] Advanced trend detection completed.")
-    print(f"Summary:")
-    print(f"  - Emerging terms: {len(ts_emerging[ts_emerging['is_emerging'] == True]) if not ts_emerging.empty else 0}")
+    print("[Phase3-FAST] Simplified trend detection completed.")
+    print("Summary:")
+    print(f"  - Emerging terms (kept): {len(ts_emerging[ts_emerging['is_emerging'] == True]) if not ts_emerging.empty else 0}")
     print(f"  - Statistical anomalies: {len(ts_anomalies)}")
-    print(f"  - Trend clusters: {len(ts_clusters)}")
+    print(f"  - Simple clusters: {len(ts_clusters)}")
+    build_trend_candidate_table()
 
 
 if __name__ == '__main__':

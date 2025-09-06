@@ -9,6 +9,14 @@ import pickle
 import json
 from datetime import datetime, timedelta
 import logging
+import warnings
+
+# Global warning suppression as requested (mute all warnings)
+warnings.filterwarnings("ignore")
+for noisy_logger in [
+    'prophet', 'cmdstanpy', 'urllib3', 'matplotlib', 'fbprophet', 'transformers'
+]:
+    logging.getLogger(noisy_logger).setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------------
 # Optional / heavyweight dependencies are guarded so the script can run in a
@@ -84,6 +92,11 @@ PROC_DIR = ROOT / "data" / "processed"
 MODELS_DIR = ROOT / "models"
 INTERIM_DIR = ROOT / "data" / "interim"
 
+# Supported aggregation frequencies we will attempt to load
+AGG_FREQUENCIES = [
+    "1h", "3h", "6h", "1d", "3d", "7d", "14d", "1m", "3m", "6m"
+]
+
 # Create directories
 for dir_path in [MODELS_DIR, INTERIM_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
@@ -105,7 +118,8 @@ class Anomaly:
     trend_component: Optional[float] = None
     seasonal_component: Optional[float] = None
     cross_platform_correlation: Optional[float] = None
-    semantic_cluster: Optional[int] = None
+    semantic_cluster: Optional[int] = None  # MiniLM / primary model
+    distilbert_cluster: Optional[int] = None  # Secondary DistilBERT semantic cluster
 
 
 @dataclass
@@ -323,133 +337,114 @@ class CrossPlatformValidator:
 
 
 class SemanticAnalyzer:
-    """Semantic validation using sentence transformers."""
-    
-    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+    """Semantic validation using sentence transformers (primary + optional DistilBERT)."""
+
+    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2", secondary_model: str = "distilbert-base-uncased"):
         self.model_name = model_name
-        self.tokenizer = None
-        self.model = None
-        self.embeddings_cache = {}
+        self.secondary_model_name = secondary_model
         self.embedding_pipeline = None
-        
-    def initialize_model(self):
-        """Initialize the sentence transformer model."""
+        self.secondary_pipeline = None
+        self.embeddings_cache: Dict[str, np.ndarray] = {}
+        self.secondary_cache: Dict[str, np.ndarray] = {}
+
+    def _init_pipeline(self, name: str):
         try:
-            # Use a simpler approach for sentence embeddings
-            self.embedding_pipeline = pipeline(
-                "feature-extraction", 
-                model=self.model_name,
-                device=0 if torch.cuda.is_available() else -1
+            return pipeline(
+                "feature-extraction",
+                model=name,
+                device=0 if HAS_TORCH and 'cuda' in str(getattr(torch, 'device', '')) and torch.cuda.is_available() else -1
             )
-            logger.info(f"Initialized semantic model: {self.model_name}")
         except Exception as e:
-            logger.warning(f"Failed to initialize semantic model: {e}")
-            self.embedding_pipeline = None
-    
-    def get_embeddings(self, texts: List[str]) -> np.ndarray:
-        """
-        Generate embeddings for text features.
-        
-        Args:
-            texts: List of text strings (hashtags, audio titles, etc.)
-            
-        Returns:
-            Array of embeddings
-        """
+            logger.error(f"Failed to load transformer model {name}: {e}")
+            return None
+
+    def initialize_models(self):
         if self.embedding_pipeline is None:
-            self.initialize_model()
-        
-        if self.embedding_pipeline is None:
-            # Fallback to TF-IDF if transformer model fails
-            logger.warning("Using TF-IDF fallback for embeddings")
-            vectorizer = TfidfVectorizer(max_features=100, stop_words='english')
-            embeddings = vectorizer.fit_transform(texts).toarray()
-            return embeddings
-        
-        embeddings = []
-        for text in texts:
-            if text in self.embeddings_cache:
-                embeddings.append(self.embeddings_cache[text])
-            else:
-                try:
-                    # Get embeddings and take mean across tokens
-                    embedding = self.embedding_pipeline(text)[0]
-                    embedding = np.mean(embedding, axis=0)
-                    self.embeddings_cache[text] = embedding
-                    embeddings.append(embedding)
-                except Exception as e:
-                    logger.warning(f"Failed to embed text '{text}': {e}")
-                    # Use zero vector as fallback
-                    embedding = np.zeros(384)  # Default size for MiniLM
-                    embeddings.append(embedding)
-        
-        return np.array(embeddings)
-    
-    def cluster_features(self, features: List[str], n_clusters: int = 5) -> List[SemanticCluster]:
-        """
-        Cluster features by semantic similarity.
-        
-        Args:
-            features: List of feature names
-            n_clusters: Number of clusters
-            
-        Returns:
-            List of semantic clusters
-        """
+            self.embedding_pipeline = self._init_pipeline(self.model_name)
+            if self.embedding_pipeline:
+                logger.info(f"Initialized semantic model: {self.model_name}")
+        if self.secondary_pipeline is None:
+            self.secondary_pipeline = self._init_pipeline(self.secondary_model_name)
+            if self.secondary_pipeline:
+                logger.info(f"Initialized DistilBERT secondary model: {self.secondary_model_name}")
+
+    def _embed_list(self, texts: List[str], pipeline_obj, cache: Dict[str, np.ndarray], expected_dim: int = 384) -> np.ndarray:
+        if pipeline_obj is None:
+            # Fallback TF-IDF
+            vectorizer = TfidfVectorizer(max_features=expected_dim, stop_words='english')
+            return vectorizer.fit_transform(texts).toarray()
+        vectors = []
+        for t in texts:
+            if t in cache:
+                vectors.append(cache[t])
+                continue
+            try:
+                emb_tokens = pipeline_obj(t)[0]
+                vec = np.mean(emb_tokens, axis=0)
+            except Exception:
+                vec = np.zeros(expected_dim)
+            cache[t] = vec
+            vectors.append(vec)
+        return np.vstack(vectors)
+
+    def get_embeddings(self, texts: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+        self.initialize_models()
+        primary = self._embed_list(texts, self.embedding_pipeline, self.embeddings_cache, expected_dim=384)
+        secondary = self._embed_list(texts, self.secondary_pipeline, self.secondary_cache, expected_dim=768)
+        return primary, secondary
+
+    def cluster_features(self, features: List[str], n_clusters: int = 5) -> Tuple[List[SemanticCluster], List[SemanticCluster]]:
         if len(features) < n_clusters:
-            n_clusters = max(1, len(features) // 2)
-        
-        embeddings = self.get_embeddings(features)
-        
-        # Perform K-means clustering
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-        cluster_labels = kmeans.fit_predict(embeddings)
-        
-        # Create cluster objects
-        clusters = []
-        for i in range(n_clusters):
-            cluster_features = [features[j] for j in range(len(features)) if cluster_labels[j] == i]
-            if cluster_features:
-                cluster_embeddings = embeddings[cluster_labels == i]
-                centroid = np.mean(cluster_embeddings, axis=0)
-                
-                # Calculate average similarity within cluster
-                similarities = cosine_similarity(cluster_embeddings)
-                avg_similarity = np.mean(similarities[np.triu_indices_from(similarities, k=1)])
-                
-                cluster = SemanticCluster(
-                    cluster_id=i,
-                    features=cluster_features,
-                    centroid_embedding=centroid,
-                    cluster_size=len(cluster_features),
-                    avg_similarity=avg_similarity if not np.isnan(avg_similarity) else 0.0
-                )
-                clusters.append(cluster)
-        
-        return clusters
-    
-    def validate_semantic_trends(self, anomalies: List[Anomaly], clusters: List[SemanticCluster]) -> List[Anomaly]:
-        """
-        Validate trends using semantic clustering.
-        
-        Args:
-            anomalies: List of detected anomalies
-            clusters: List of semantic clusters
-            
-        Returns:
-            List of anomalies with cluster information
-        """
-        # Create feature to cluster mapping
-        feature_to_cluster = {}
-        for cluster in clusters:
-            for feature in cluster.features:
-                feature_to_cluster[feature] = cluster.cluster_id
-        
-        # Update anomalies with cluster information
-        for anomaly in anomalies:
-            if anomaly.feature in feature_to_cluster:
-                anomaly.semantic_cluster = feature_to_cluster[anomaly.feature]
-        
+            n_clusters = max(1, len(features)//2 or 1)
+        prim_emb, sec_emb = self.get_embeddings(features)
+        clusters_primary: List[SemanticCluster] = []
+        clusters_secondary: List[SemanticCluster] = []
+        # Primary clustering
+        try:
+            k1 = KMeans(n_clusters=n_clusters, random_state=42)
+            labels1 = k1.fit_predict(prim_emb)
+            for i in range(n_clusters):
+                feats = [features[j] for j in range(len(features)) if labels1[j] == i]
+                if not feats:
+                    continue
+                emb_grp = prim_emb[labels1 == i]
+                centroid = emb_grp.mean(axis=0)
+                sims = cosine_similarity(emb_grp)
+                avg_sim = np.mean(sims[np.triu_indices_from(sims, k=1)]) if emb_grp.shape[0] > 1 else 1.0
+                clusters_primary.append(SemanticCluster(i, feats, centroid, len(feats), float(avg_sim)))
+        except Exception as e:
+            logger.error(f"Primary clustering failed: {e}")
+        # Secondary clustering (DistilBERT)
+        try:
+            k2 = KMeans(n_clusters=n_clusters, random_state=42)
+            labels2 = k2.fit_predict(sec_emb)
+            for i in range(n_clusters):
+                feats = [features[j] for j in range(len(features)) if labels2[j] == i]
+                if not feats:
+                    continue
+                emb_grp = sec_emb[labels2 == i]
+                centroid = emb_grp.mean(axis=0)
+                sims = cosine_similarity(emb_grp)
+                avg_sim = np.mean(sims[np.triu_indices_from(sims, k=1)]) if emb_grp.shape[0] > 1 else 1.0
+                clusters_secondary.append(SemanticCluster(i, feats, centroid, len(feats), float(avg_sim)))
+        except Exception as e:
+            logger.error(f"Secondary (DistilBERT) clustering failed: {e}")
+        return clusters_primary, clusters_secondary
+
+    def annotate_anomalies(self, anomalies: List[Anomaly], clusters_primary: List[SemanticCluster], clusters_secondary: List[SemanticCluster]) -> List[Anomaly]:
+        fmap_primary = {}
+        fmap_secondary = {}
+        for c in clusters_primary:
+            for f in c.features:
+                fmap_primary[f] = c.cluster_id
+        for c in clusters_secondary:
+            for f in c.features:
+                fmap_secondary[f] = c.cluster_id
+        for an in anomalies:
+            if an.feature in fmap_primary:
+                an.semantic_cluster = fmap_primary[an.feature]
+            if an.feature in fmap_secondary:
+                an.distilbert_cluster = fmap_secondary[an.feature]
         return anomalies
 
 
@@ -511,68 +506,55 @@ class DemographicAnalyzer:
 
 
 class SentimentAnalyzer:
-    """Sentiment analysis for trend-related content."""
-    
+    """Sentiment analysis for trend-related content (CardiffNLP)."""
+
     def __init__(self):
         self.sentiment_pipeline = None
-        
+        self.model_name = "cardiffnlp/twitter-roberta-base-sentiment"
+
     def initialize_sentiment_model(self):
-        """Initialize sentiment analysis pipeline."""
         try:
             self.sentiment_pipeline = pipeline(
                 "sentiment-analysis",
-                model="cardiffnlp/twitter-roberta-base-sentiment-latest",
-                device=0 if torch.cuda.is_available() else -1
+                model=self.model_name,
+                device=0 if HAS_TORCH and torch.cuda.is_available() else -1
             )
-            logger.info("Initialized sentiment analysis model")
+            logger.info(f"Initialized sentiment model: {self.model_name}")
         except Exception as e:
-            logger.warning(f"Failed to initialize sentiment model: {e}")
-            # Use a simpler fallback
+            logger.error(f"Failed to initialize CardiffNLP sentiment model: {e}")
             try:
                 self.sentiment_pipeline = pipeline("sentiment-analysis")
-                logger.info("Using fallback sentiment model")
-            except:
+                logger.info("Using generic fallback sentiment model")
+            except Exception:
                 self.sentiment_pipeline = None
-    
+
     def analyze_sentiment(self, texts: List[str]) -> List[Dict[str, float]]:
-        """
-        Analyze sentiment of text content.
-        
-        Args:
-            texts: List of text content
-            
-        Returns:
-            List of sentiment scores
-        """
         if self.sentiment_pipeline is None:
             self.initialize_sentiment_model()
-        
         if self.sentiment_pipeline is None:
-            return [{'positive': 0.5, 'negative': 0.5, 'neutral': 0.5} for _ in texts]
-        
-        sentiments = []
-        for text in texts:
+            return [{'positive': 0.33, 'negative': 0.33, 'neutral': 0.34} for _ in texts]
+        outputs = []
+        for t in texts:
             try:
-                result = self.sentiment_pipeline(text)
-                sentiment_dict = {'positive': 0.0, 'negative': 0.0, 'neutral': 0.0}
-                
-                for item in result:
-                    label = item['label'].lower()
-                    score = item['score']
-                    
-                    if 'pos' in label:
-                        sentiment_dict['positive'] = score
-                    elif 'neg' in label:
-                        sentiment_dict['negative'] = score
-                    else:
-                        sentiment_dict['neutral'] = score
-                
-                sentiments.append(sentiment_dict)
-            except Exception as e:
-                logger.warning(f"Sentiment analysis failed for text: {e}")
-                sentiments.append({'positive': 0.5, 'negative': 0.5, 'neutral': 0.5})
-        
-        return sentiments
+                res = self.sentiment_pipeline(t)
+                sent = {'positive': 0.0, 'negative': 0.0, 'neutral': 0.0}
+                for item in res:
+                    lab = item['label'].lower()
+                    sc = float(item['score'])
+                    if 'positive' in lab or 'pos' in lab:
+                        sent['positive'] = sc
+                    elif 'negative' in lab or 'neg' in lab:
+                        sent['negative'] = sc
+                    elif 'neutral' in lab:
+                        sent['neutral'] = sc
+                # Normalize if sums to >1 due to independent scoring variants
+                ssum = sum(sent.values()) or 1.0
+                for k in sent:
+                    sent[k] /= ssum
+                outputs.append(sent)
+            except Exception:
+                outputs.append({'positive': 0.33, 'negative': 0.33, 'neutral': 0.34})
+        return outputs
 
 
 class TrendDecayDetector:
@@ -669,7 +651,11 @@ class TrendDetectionModel:
         # Initialize components
         self.stl_detector = STLAnomalyDetector(period=period, threshold_std=threshold_std)
         self.cross_platform_validator = CrossPlatformValidator()
-        self.semantic_analyzer = SemanticAnalyzer()
+        # Semantic analyzers (MiniLM + DistilBERT hybrid)
+        self.semantic_analyzer = SemanticAnalyzer(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            secondary_model="distilbert-base-uncased"
+        )
         self.demographic_analyzer = DemographicAnalyzer()
         self.sentiment_analyzer = SentimentAnalyzer()
         self.decay_detector = TrendDecayDetector()
@@ -730,8 +716,9 @@ class TrendDetectionModel:
         # 4. Semantic validation
         feature_names = [anomaly.feature for anomaly in all_anomalies]
         if feature_names:
-            clusters = self.semantic_analyzer.cluster_features(list(set(feature_names)))
-            all_anomalies = self.semantic_analyzer.validate_semantic_trends(all_anomalies, clusters)
+            unique_features = list(set(feature_names))
+            clusters_primary, clusters_secondary = self.semantic_analyzer.cluster_features(unique_features)
+            all_anomalies = self.semantic_analyzer.annotate_anomalies(all_anomalies, clusters_primary, clusters_secondary)
         
         # Convert results to DataFrame
         if all_anomalies:
@@ -1131,113 +1118,159 @@ class ModelPersistence:
 
 def load_processed_features() -> Dict[str, pd.DataFrame]:
     """Load processed feature datasets."""
-    datasets = {}
-    
-    feature_files = [
-        'features_hashtags_6h.parquet',
-        'features_keywords_6h.parquet', 
-        'features_emerging_terms_6h.parquet',
-        'features_audio_6h.parquet'
+    datasets: Dict[str, pd.DataFrame] = {}
+
+    base_feature_roots = [
+        "features_hashtags_", "features_keywords_", "features_emerging_terms_", "features_audio_"
     ]
-    
-    for file in feature_files:
-        filepath = PROC_DIR / file
-        if filepath.exists():
-            try:
-                df = pd.read_parquet(filepath)
-                datasets[file.replace('.parquet', '')] = df
-                logger.info(f"Loaded {file}: {len(df)} rows")
-            except Exception as e:
-                logger.error(f"Failed to load {file}: {e}")
-    
+
+    for freq in AGG_FREQUENCIES:
+        for root_name in base_feature_roots:
+            file = f"{root_name}{freq}.parquet"
+            filepath = PROC_DIR / file
+            if filepath.exists():
+                try:
+                    df = pd.read_parquet(filepath)
+                    if df.empty:
+                        continue
+                    # Attach frequency column for downstream logic
+                    df['frequency'] = freq
+                    key = file.replace('.parquet', '')
+                    datasets[key] = df
+                    logger.info(f"Loaded {file}: {len(df)} rows")
+                except Exception as e:
+                    logger.error(f"Failed to load {file}: {e}")
+
+    if not datasets:
+        logger.warning("No processed feature parquet files found across supported frequencies.")
+    else:
+        logger.info(f"Loaded feature datasets for frequencies: {sorted({df['frequency'].iloc[0] for df in datasets.values()})}")
     return datasets
 
 
-def run_comprehensive_modeling(datasets: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
-    """Run comprehensive modeling pipeline."""
-    results = {
-        'trend_detection': {},
-        'forecasting': {},
-        'classification': {},
-        'metrics': []
+def _compute_stl_period(freq: str) -> int:
+    """Heuristic period selection per aggregation frequency for STL.
+
+    For hourly aggregations we approximate daily seasonality.
+    For daily / multi-day we approximate weekly or monthly cycles.
+    """
+    mapping = {
+        '1h': 24,   # 24 hours ~ daily
+        '3h': 8,    # 8 * 3h = 24h
+        '6h': 4,    # 4 * 6h = 24h
+        '1d': 7,    # weekly
+        '3d': 7,    # still try weekly-ish (approx)
+        '7d': 8,    # ~ two months of weekly points (arbitrary > seasonal req)
+        '14d': 6,   # ~ quarter-year segmentation
+        '1m': 12,   # yearly seasonality in months
+        '3m': 8,    # multi-quarter pattern
+        '6m': 4     # yearly split into halves
     }
-    
-    # Combine all feature datasets
-    all_features = []
+    return mapping.get(freq, 7)
+
+
+def run_comprehensive_modeling(datasets: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    """Run modeling pipeline across all available aggregation frequencies.
+
+    For each frequency we run anomaly detection. Forecasting & classification
+    are performed only on a chosen base frequency (prefers 6h, then 1h, else first available).
+    """
+    results: Dict[str, Any] = {
+        'trend_detection': {},   # per-frequency anomalies
+        'forecasting': {},       # base frequency forecasts
+        'classification': {},    # base frequency classification
+        'metrics': [],
+        'base_frequency': None
+    }
+
+    # Organize datasets by frequency (expect column 'frequency')
+    freq_groups: Dict[str, List[pd.DataFrame]] = {}
     for name, df in datasets.items():
-        if not df.empty and 'category' in df.columns:
-            df_copy = df.copy()
-            df_copy['source'] = name
-            all_features.append(df_copy)
-    
-    if not all_features:
-        logger.warning("No feature datasets available for modeling")
+        if 'frequency' not in df.columns:
+            continue
+        freq = df['frequency'].iloc[0]
+        freq_groups.setdefault(freq, []).append(df)
+
+    if not freq_groups:
+        logger.warning("No datasets with 'frequency' column available for modeling.")
         return results
-    
-    combined_df = pd.concat(all_features, ignore_index=True)
-    logger.info(f"Combined dataset: {len(combined_df)} rows")
-    
-    # 1. Trend Detection Models
-    logger.info("Training trend detection models...")
-    trend_detector = TrendDetectionModel(contamination=0.1)
-    trend_detector.fit(combined_df)
-    
-    anomalies = trend_detector.predict_anomalies(combined_df)
-    results['trend_detection']['anomalies'] = anomalies
-    
-    # Save trend detection model
-    ModelPersistence.save_model(
-        trend_detector, 
-        MODELS_DIR / 'trend_detection_model.pkl',
-        {'type': 'trend_detection', 'contamination': 0.1}
-    )
-    
-    # 2. Time Series Forecasting
-    logger.info("Training forecasting models...")
-    forecaster = TimeSeriesForecaster()
-    
-    # Get top features by activity for forecasting
-    top_features = (combined_df.groupby('feature')['count']
-                   .sum()
-                   .sort_values(ascending=False)
-                   .head(10)
-                   .index.tolist())
-    
-    for feature in top_features:
-        feature_forecasts = forecaster.forecast_feature(combined_df, feature, periods=24)
-        if feature_forecasts:
-            results['forecasting'][feature] = feature_forecasts
-    
-    # Save forecasting models
-    ModelPersistence.save_model(
-        forecaster,
-        MODELS_DIR / 'forecasting_models.pkl',
-        {'type': 'time_series_forecasting', 'top_features': top_features}
-    )
-    
-    # 3. Category Classification
-    logger.info("Training classification models...")
-    classifier = TrendCategoryClassifier()
-    
-    # Filter data with sufficient samples per category
-    category_counts = combined_df['category'].value_counts()
-    valid_categories = category_counts[category_counts >= 50].index
-    classification_df = combined_df[combined_df['category'].isin(valid_categories)]
-    
-    if len(classification_df) > 100:
-        classifier.fit(classification_df)
-        
-        # Get predictions
-        predictions = classifier.predict_categories(classification_df)
-        results['classification']['predictions'] = predictions
-        
-        # Save classification model
+
+    # Determine base frequency for forecasting & classification
+    preferred_order = ['6h', '1h', '3h', '1d']
+    available_freqs = set(freq_groups.keys())
+    base_freq = next((f for f in preferred_order if f in available_freqs), None)
+    if base_freq is None:
+        base_freq = sorted(available_freqs)[0]
+    results['base_frequency'] = base_freq
+    logger.info(f"Selected base frequency for forecasting/classification: {base_freq}")
+
+    all_anomaly_frames = []
+
+    for freq, frames in freq_groups.items():
+        combined = pd.concat(frames, ignore_index=True)
+        if combined.empty or 'category' not in combined.columns:
+            logger.warning(f"Skipping frequency {freq}: empty or missing category column")
+            continue
+        logger.info(f"Processing frequency {freq}: {len(combined)} rows across {len(frames)} tables")
+
+        period = _compute_stl_period(freq)
+        trend_detector = TrendDetectionModel(contamination=0.1, period=period)
+        trend_detector.fit(combined)
+        anomalies_df = trend_detector.predict_anomalies(combined)
+        if not anomalies_df.empty:
+            anomalies_df['frequency'] = freq
+            all_anomaly_frames.append(anomalies_df)
+        results['trend_detection'][freq] = anomalies_df
+
+        # Persist detector per frequency (lightweight)
         ModelPersistence.save_model(
-            classifier,
-            MODELS_DIR / 'classification_model.pkl',
-            {'type': 'category_classification', 'valid_categories': valid_categories.tolist()}
+            trend_detector,
+            MODELS_DIR / f'trend_detection_model_{freq}.pkl',
+            {'type': 'trend_detection', 'contamination': 0.1, 'frequency': freq}
         )
-    
+
+        # Only run forecasting/classification for base frequency
+        if freq == base_freq:
+            # Forecasting
+            logger.info(f"Training forecasting models for base frequency {base_freq}...")
+            forecaster = TimeSeriesForecaster()
+            top_features = (combined.groupby('feature')['count']
+                            .sum()
+                            .sort_values(ascending=False)
+                            .head(10)
+                            .index.tolist())
+            for feature in top_features:
+                feature_forecasts = forecaster.forecast_feature(combined, feature, periods=24)
+                if feature_forecasts:
+                    results['forecasting'][feature] = feature_forecasts
+            ModelPersistence.save_model(
+                forecaster,
+                MODELS_DIR / f'forecasting_models_{base_freq}.pkl',
+                {'type': 'time_series_forecasting', 'top_features': top_features, 'frequency': base_freq}
+            )
+
+            # Classification
+            logger.info(f"Training classification models for base frequency {base_freq}...")
+            classifier = TrendCategoryClassifier()
+            category_counts = combined['category'].value_counts()
+            valid_categories = category_counts[category_counts >= 50].index
+            classification_df = combined[combined['category'].isin(valid_categories)]
+            if len(classification_df) > 100:
+                classifier.fit(classification_df)
+                predictions = classifier.predict_categories(classification_df)
+                results['classification']['predictions'] = predictions
+                ModelPersistence.save_model(
+                    classifier,
+                    MODELS_DIR / f'classification_model_{base_freq}.pkl',
+                    {'type': 'category_classification', 'valid_categories': valid_categories.tolist(), 'frequency': base_freq}
+                )
+
+    # Concatenate anomalies across frequencies for backward compatibility key
+    if all_anomaly_frames:
+        results['trend_detection']['anomalies'] = pd.concat(all_anomaly_frames, ignore_index=True)
+    else:
+        results['trend_detection']['anomalies'] = pd.DataFrame()
+
     return results
 
 
@@ -1251,16 +1284,23 @@ def generate_model_report(results: Dict[str, Any]):
     
     # Trend Detection Results
     lines.append("## Trend Detection Models")
-    anomalies = results['trend_detection'].get('anomalies', pd.DataFrame())
-    if not anomalies.empty:
-        lines.append(f"- Anomalies detected: {len(anomalies)}")
-        lines.append("- Models used: STL Decomposition with Cross-Platform & Semantic Validation")
-        
-        # Top anomalies
-        top_anomalies = anomalies.nlargest(10, 'score')
-        lines.append("\n### Top Anomalies Detected")
+    anomalies_all = results['trend_detection'].get('anomalies', pd.DataFrame())
+    if not anomalies_all.empty:
+        lines.append(f"- Total anomalies detected (all frequencies): {len(anomalies_all)}")
+        freqs_present = sorted(anomalies_all['frequency'].unique()) if 'frequency' in anomalies_all.columns else []
+        if freqs_present:
+            lines.append(f"- Frequencies covered: {', '.join(freqs_present)}")
+        lines.append("- Models: Per-frequency STL (dynamic period) + Cross-Platform & Semantic Validation")
+        # Show per-frequency counts
+        if 'frequency' in anomalies_all.columns:
+            freq_counts = anomalies_all.groupby('frequency').size().sort_values(ascending=False)
+            lines.append("\n### Anomalies by Frequency")
+            lines.append(freq_counts.to_frame('count').to_markdown())
+        # Top anomalies global
+        top_anomalies = anomalies_all.nlargest(10, 'score')
+        lines.append("\n### Top Anomalies (Global)")
         try:
-            cols = ['feature', 'timestamp', 'score', 'anomaly_type', 'platform', 'semantic_cluster']
+            cols = ['feature', 'timestamp', 'frequency', 'score', 'anomaly_type', 'platform', 'semantic_cluster']
             cols = [c for c in cols if c in top_anomalies.columns]
             lines.append(top_anomalies[cols].to_markdown(index=False))
         except Exception as e:
@@ -1274,8 +1314,10 @@ def generate_model_report(results: Dict[str, Any]):
     lines.append("## Time Series Forecasting Models")
     forecasting_results = results['forecasting']
     if forecasting_results:
+        base_freq = results.get('base_frequency')
+        lines.append(f"- Base frequency: {base_freq}")
         lines.append(f"- Features forecasted: {len(forecasting_results)}")
-        lines.append("- Models used: Prophet, ARIMA, ETS")
+        lines.append("- Models used: Prophet, ARIMA (ETS reserved)")
         
         lines.append("\n### Forecasting Performance")
         for feature, models in forecasting_results.items():
