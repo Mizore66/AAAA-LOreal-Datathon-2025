@@ -162,6 +162,17 @@ hair_keywords = [
     "hair mask", "heat protectant", "leave in", "bond builder", "scalp serum", "shampoo",
     "conditioner", "sulfate free", "keratin", "argan oil", "rosemary oil", "hair growth"
 ]
+# Enhanced with Beauty and Fashion categories
+beauty_keywords = [
+    "beauty", "beautiful", "glow", "glowing", "radiant", "aesthetic", "skincare routine", 
+    "beauty routine", "self care", "selfcare", "beauty tips", "beauty hack", "beauty trends",
+    "natural beauty", "fresh faced", "glam", "glamorous", "stunning", "gorgeous"
+]
+fashion_keywords = [
+    "fashion", "style", "outfit", "ootd", "fashion week", "trends", "runway", "designer",
+    "chic", "elegant", "fashionable", "stylish", "wardrobe", "fashion blogger", "style tips",
+    "fashion trends", "street style", "haute couture", "accessories", "jewelry"
+]
 
 for kw in skincare_keywords:
     KEYWORD_CATEGORY[kw] = "Skincare"
@@ -169,9 +180,130 @@ for kw in makeup_keywords:
     KEYWORD_CATEGORY[kw] = "Makeup"
 for kw in hair_keywords:
     KEYWORD_CATEGORY[kw] = "Hair"
+for kw in beauty_keywords:
+    KEYWORD_CATEGORY[kw] = "Beauty"
+for kw in fashion_keywords:
+    KEYWORD_CATEGORY[kw] = "Fashion"
 
 # Timeframe configurations
 TIMEFRAME_LABELS = ["1h", "3h", "6h", "1d", "3d", "7d", "14d", "1m", "3m", "6m"]
+
+# Target categories for relevance filtering
+RELEVANT_CATEGORIES = {"Beauty", "Fashion", "Skincare", "Makeup", "Hair"}
+
+def is_trend_relevant(feature: str, category: str = None) -> bool:
+    """
+    Check if a trend word is similar/relevant to Beauty/Fashion/Skincare/Makeup/Hair categories.
+    
+    Args:
+        feature: The trend word/feature to check
+        category: Optional pre-computed category to avoid recomputation
+    
+    Returns:
+        bool: True if the trend is relevant to target categories
+    """
+    if not isinstance(feature, str):
+        return False
+    
+    # Normalize the feature
+    f = feature.lstrip('#').lower()
+    
+    # Quick exclusion filter for clearly irrelevant terms
+    irrelevant_patterns = [
+        "technology", "tech", "gaming", "game", "sport", "politics", "political",
+        "news", "food", "recipe", "cooking", "travel", "vacation", "study", "work",
+        "job", "career", "finance", "money", "crypto", "stock", "investment",
+        "education", "school", "university", "medical", "health", "fitness", "gym",
+        "workout", "exercise", "diet", "nutrition", "weight loss"
+    ]
+    
+    # If any irrelevant patterns are found, exclude immediately
+    for pattern in irrelevant_patterns:
+        if pattern in f:
+            return False
+    
+    # Use provided category or compute it
+    if category is None:
+        category = categorize_feature(feature)
+    
+    # Primary filter: check if category is in our target categories
+    if category in RELEVANT_CATEGORIES:
+        return True
+    
+    # Secondary filter: additional semantic similarity checks for edge cases
+    # Check for common beauty/fashion related terms that might not be caught by categorization
+    beauty_related_patterns = [
+        # General beauty terms
+        "glow", "radiant", "stunning", "gorgeous", "beautiful", "pretty", "cute", "hot",
+        # Self-care and wellness
+        "selfcare", "self care", "wellness", "pamper", "relax", "spa",
+        # Social media beauty trends
+        "getready", "grwm", "transformation", "makeover", "reveal", "before", "after",
+        # Aesthetic terms
+        "aesthetic", "vibe", "mood", "energy", "aura", "soft", "natural", "fresh",
+        # General style terms
+        "style", "stylish", "chic", "trendy", "fashionable", "classy", "elegant",
+        # Product-related terms that might be missed
+        "product", "brand", "review", "haul", "favorite", "recommend", "obsess",
+        # Body/appearance related
+        "face", "eyes", "lips", "lashes", "eyebrows", "cheeks", "complexion"
+    ]
+    
+    # Check if any beauty-related patterns are present
+    for pattern in beauty_related_patterns:
+        if pattern in f:
+            return True
+    
+    # Tertiary filter: check for brand names or product mentions (more specific)
+    # Only consider as relevant if it's clearly beauty/fashion product related
+    potential_beauty_product_indicators = [
+        "serum", "cream", "moisturizer", "cleanser", "mask", "treatment", "oil", 
+        "product review", "brand review", "beauty product", "skincare product",
+        "makeup product", "hair product", "collection launch", "beauty brand",
+        "skincare brand", "makeup brand", "hair brand", "beauty line",
+        "collab", "collaboration", "partnership"
+    ]
+    
+    for indicator in potential_beauty_product_indicators:
+        if indicator in f and len(f) > 5:  # More stringent length requirement
+            return True
+    
+    return False
+
+def filter_relevant_emerging_terms(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Filter emerging terms DataFrame to only include relevant Beauty/Fashion/Skincare/Makeup/Hair terms.
+    
+    Args:
+        df: DataFrame with emerging terms data
+    
+    Returns:
+        pd.DataFrame: Filtered DataFrame with only relevant terms
+    """
+    if df.empty:
+        return df
+    
+    # Apply relevance filter
+    if 'category' in df.columns:
+        # Use pre-computed categories for efficiency
+        df['is_relevant'] = df.apply(lambda row: is_trend_relevant(row['feature'], row['category']), axis=1)
+    else:
+        # Compute relevance without category
+        df['is_relevant'] = df['feature'].apply(lambda x: is_trend_relevant(x))
+    
+    # Filter to only relevant terms
+    relevant_df = df[df['is_relevant']].copy()
+    
+    # Drop the temporary column
+    relevant_df = relevant_df.drop(columns=['is_relevant'])
+    
+    # Log filtering results
+    original_count = len(df)
+    filtered_count = len(relevant_df)
+    logger.info(f"Relevance filtering: {original_count} -> {filtered_count} terms "
+                f"({filtered_count/max(1,original_count)*100:.1f}% relevant)")
+    
+    return relevant_df
 
 _FREQ_MAP = {
     '1h': '1H', '3h': '3H', '6h': '6H', '1d': '1D', '3d': '3D', '7d': '7D', '14d': '14D'
@@ -285,7 +417,7 @@ cache = PerformanceCache(CACHE_DIR)
 # -----------------------------
 
 def categorize_feature(feature: str) -> str:
-    """Optimized feature categorization with caching."""
+    """Optimized feature categorization with enhanced Beauty/Fashion support."""
     if not isinstance(feature, str):
         return "Other"
     
@@ -300,13 +432,31 @@ def categorize_feature(feature: str) -> str:
         if k in f:
             return cat
     
-    # Quick heuristic categorization
-    if any(tok in f for tok in ["skin", "spf", "sunscreen", "barrier", "niacinamide", "retinol", "serum"]):
+    # Enhanced heuristic categorization with Beauty/Fashion
+    # Skincare patterns
+    if any(tok in f for tok in ["skin", "spf", "sunscreen", "barrier", "niacinamide", "retinol", "serum", 
+                                "cleanser", "moistur", "acne", "pore", "anti-aging", "wrinkle"]):
         return "Skincare"
-    if any(tok in f for tok in ["lip", "lash", "brow", "blush", "contour", "eyeshadow", "mascara", "liner"]):
+    
+    # Makeup patterns
+    if any(tok in f for tok in ["lip", "lash", "brow", "blush", "contour", "eyeshadow", "mascara", 
+                                "liner", "foundation", "concealer", "powder", "primer", "bronzer"]):
         return "Makeup"
-    if any(tok in f for tok in ["hair", "scalp", "shampoo", "conditioner", "keratin", "oil"]):
+    
+    # Hair patterns
+    if any(tok in f for tok in ["hair", "scalp", "shampoo", "conditioner", "keratin", "treatment",
+                                "curl", "straight", "frizz", "volume", "hair care"]):
         return "Hair"
+    
+    # Beauty patterns
+    if any(tok in f for tok in ["beauty", "beautiful", "glow", "radiant", "aesthetic", "selfcare",
+                                "self care", "routine", "transformation", "before after", "reveal"]):
+        return "Beauty"
+    
+    # Fashion patterns
+    if any(tok in f for tok in ["fashion", "style", "outfit", "ootd", "look", "trend", "chic",
+                                "elegant", "outfit of the day", "street style", "fashion week"]):
+        return "Fashion"
     
     return "Other"
 
@@ -720,6 +870,10 @@ def aggregate_emerging_terms_optimized(dfs: List[Tuple[str, pd.DataFrame]],
     # Identify emerging terms
     allg["is_emerging"] = allg["growth_rate"] >= min_growth_rate
     allg["category"] = allg["feature"].apply(categorize_feature)
+    
+    # Apply relevance filtering for Beauty/Fashion/Skincare/Makeup/Hair
+    logger.info("Applying relevance filtering for Beauty/Fashion/Skincare/Makeup/Hair trends")
+    allg = filter_relevant_emerging_terms(allg)
     
     # Velocity calculation (expensive, controlled by config)
     if CONFIG["compute_velocity"] and label == '6h':
