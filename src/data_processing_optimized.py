@@ -56,7 +56,11 @@ PERF_CONFIGS = {
         "compute_velocity": False,
         "enable_parallel": True,
         "enable_caching": True,
-        "streaming_threshold_mb": 100
+        "streaming_threshold_mb": 100,
+        "enable_chunking": True,
+        "chunk_size": 25_000,
+        "chunk_memory_limit_mb": 200,
+        "chunking_threshold_rows": 75_000
     },
     "BALANCED": {
         "max_features_emerging": 400,
@@ -65,8 +69,12 @@ PERF_CONFIGS = {
         "sample_rows_per_source": 100_000,
         "compute_velocity": True,
         "enable_parallel": True,
-        "enable_caching": True,
-        "streaming_threshold_mb": 200
+        "enable_caching": False,
+        "streaming_threshold_mb": 200,
+        "enable_chunking": True,
+        "chunk_size": 50_000,
+        "chunk_memory_limit_mb": 300,
+        "chunking_threshold_rows": 100_000
     },
     "THOROUGH": {
         "max_features_emerging": None,
@@ -76,7 +84,11 @@ PERF_CONFIGS = {
         "compute_velocity": True,
         "enable_parallel": False,
         "enable_caching": True,
-        "streaming_threshold_mb": 500
+        "streaming_threshold_mb": 500,
+        "enable_chunking": True,
+        "chunk_size": 75_000,
+        "chunk_memory_limit_mb": 400,
+        "chunking_threshold_rows": 150_000
     }
 }
 
@@ -525,6 +537,148 @@ def extract_all_terms_optimized(text: str, min_length: int = 3, max_terms: int =
     return terms[:max_terms]  # Hard limit
 
 # -----------------------------
+# Dataset-Specific Preprocessing Functions
+# -----------------------------
+
+def preprocess_comments_dataset(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """
+    Preprocess YouTube comments dataset based on schema.
+    
+    Expected columns: commentId, parentCommentId, channelId, videoId, authorId,
+                     textOriginal, likeCount, publishedAt, updatedAt
+    """
+    if df.empty:
+        return None
+    
+    logger.info(f"Preprocessing comments dataset: {len(df):,} rows")
+    
+    # Check for required columns
+    required_cols = ['textOriginal', 'publishedAt']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        logger.warning(f"Missing required columns for comments: {missing_cols}")
+        return None
+    
+    # Create standardized columns for text processing
+    processed_df = df.copy()
+    
+    # Standardize timestamp column
+    processed_df['timestamp'] = pd.to_datetime(processed_df['publishedAt'], errors='coerce')
+    
+    # Standardize text column
+    processed_df['text'] = processed_df['textOriginal'].astype(str)
+    
+    # Add engagement metrics if available
+    if 'likeCount' in processed_df.columns:
+        processed_df['engagement_score'] = pd.to_numeric(processed_df['likeCount'], errors='coerce').fillna(0)
+    else:
+        processed_df['engagement_score'] = 0
+    
+    # Add reply indicator for threading analysis
+    if 'parentCommentId' in processed_df.columns:
+        processed_df['is_reply'] = processed_df['parentCommentId'].notna()
+    else:
+        processed_df['is_reply'] = False
+    
+    # Add video context if available
+    if 'videoId' in processed_df.columns:
+        processed_df['video_id'] = processed_df['videoId']
+    
+    # Filter out invalid entries
+    processed_df = processed_df.dropna(subset=['timestamp', 'text'])
+    processed_df = processed_df[processed_df['text'].str.len() > 0]
+    
+    # Add dataset type identifier
+    processed_df['dataset_type'] = 'comments'
+    
+    logger.info(f"Comments preprocessing complete: {len(processed_df):,} valid rows")
+    return processed_df
+
+def preprocess_videos_dataset(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """
+    Preprocess YouTube videos dataset based on schema.
+    
+    Expected columns: channelId, videoId, title, description, tags, defaultLanguage,
+                     defaultAudioLanguage, contentDuration, viewCount, likeCount,
+                     favouriteCount, commentCount, topicCategories, publishedAt
+    """
+    if df.empty:
+        return None
+    
+    logger.info(f"Preprocessing videos dataset: {len(df):,} rows")
+    
+    # Check for required columns
+    required_cols = ['title', 'publishedAt']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        logger.warning(f"Missing required columns for videos: {missing_cols}")
+        return None
+    
+    # Create standardized columns for text processing
+    processed_df = df.copy()
+    
+    # Standardize timestamp column
+    processed_df['timestamp'] = pd.to_datetime(processed_df['publishedAt'], errors='coerce')
+    
+    # Combine title, description, and tags for comprehensive text analysis
+    text_parts = []
+    if 'title' in processed_df.columns:
+        text_parts.append(processed_df['title'].fillna('').astype(str))
+    if 'description' in processed_df.columns:
+        text_parts.append(processed_df['description'].fillna('').astype(str))
+    if 'tags' in processed_df.columns:
+        # Handle tags - they might be stored as strings or lists
+        tags_text = processed_df['tags'].fillna('').astype(str)
+        text_parts.append(tags_text)
+    
+    if text_parts:
+        processed_df['text'] = text_parts[0]
+        for part in text_parts[1:]:
+            processed_df['text'] = processed_df['text'] + ' ' + part
+    else:
+        processed_df['text'] = ''
+    
+    # Calculate comprehensive engagement score
+    engagement_components = []
+    if 'viewCount' in processed_df.columns:
+        views = pd.to_numeric(processed_df['viewCount'], errors='coerce').fillna(0)
+        engagement_components.append(views * 0.1)  # Weight views lower
+    if 'likeCount' in processed_df.columns:
+        likes = pd.to_numeric(processed_df['likeCount'], errors='coerce').fillna(0)
+        engagement_components.append(likes * 5)  # Weight likes higher
+    if 'commentCount' in processed_df.columns:
+        comments = pd.to_numeric(processed_df['commentCount'], errors='coerce').fillna(0)
+        engagement_components.append(comments * 10)  # Weight comments highest
+    if 'favouriteCount' in processed_df.columns:
+        favorites = pd.to_numeric(processed_df['favouriteCount'], errors='coerce').fillna(0)
+        engagement_components.append(favorites * 15)  # Weight favorites very high
+    
+    if engagement_components:
+        processed_df['engagement_score'] = sum(engagement_components)
+    else:
+        processed_df['engagement_score'] = 0
+    
+    # Add content metadata
+    if 'contentDuration' in processed_df.columns:
+        processed_df['content_duration'] = processed_df['contentDuration']
+    
+    if 'topicCategories' in processed_df.columns:
+        processed_df['topic_categories'] = processed_df['topicCategories']
+    
+    if 'videoId' in processed_df.columns:
+        processed_df['video_id'] = processed_df['videoId']
+    
+    # Filter out invalid entries
+    processed_df = processed_df.dropna(subset=['timestamp', 'text'])
+    processed_df = processed_df[processed_df['text'].str.len() > 0]
+    
+    # Add dataset type identifier
+    processed_df['dataset_type'] = 'videos'
+    
+    logger.info(f"Videos preprocessing complete: {len(processed_df):,} valid rows")
+    return processed_df
+
+# -----------------------------
 # Memory-Efficient Data Loading
 # -----------------------------
 
@@ -550,25 +704,44 @@ def sample_large_dataset(df: pd.DataFrame, max_rows: Optional[int] = None) -> pd
         return df.sample(n=max_rows, random_state=42)
 
 def load_samples_optimized() -> Dict[str, pd.DataFrame]:
-    """Optimized data loading with memory management."""
-    logger.info("Loading processed datasets with memory optimization")
+    """Optimized data loading with memory management and dataset type separation."""
+    logger.info("Loading processed datasets with memory optimization and dataset type separation")
     out: Dict[str, pd.DataFrame] = {}
     
-    # Prefer full files over samples
-    files = [p for p in PROC_DIR.glob('*.parquet') if not p.name.endswith('.sample.parquet')]
-    if not files:
-        files = list(PROC_DIR.glob('*.parquet'))
+    # Separate comment and video files for optimized processing
+    comment_files = [p for p in PROC_DIR.glob('comments*.parquet') if not p.name.endswith('.sample.parquet')]
+    video_files = [p for p in PROC_DIR.glob('videos*.parquet') if not p.name.endswith('.sample.parquet')]
     
-    logger.info(f"Found {len(files)} parquet files to process")
+    # If no full files, fall back to sample files
+    if not comment_files:
+        comment_files = [p for p in PROC_DIR.glob('comments*.sample.parquet')]
+    if not video_files:
+        video_files = [p for p in PROC_DIR.glob('videos*.sample.parquet')]
+    
+    all_files = comment_files + video_files
+    logger.info(f"Found {len(comment_files)} comment files and {len(video_files)} video files")
     
     total_memory_mb = 0
-    for p in files:
+    for p in all_files:
         name = p.stem
+        dataset_type = "comments" if "comment" in p.name.lower() else "videos"
+        
         try:
             # Check file size before loading
             file_size_mb = p.stat().st_size / (1024 * 1024)
             
             df = pd.read_parquet(p)
+            
+            # Apply dataset-specific preprocessing
+            if dataset_type == "comments":
+                df = preprocess_comments_dataset(df)
+            else:
+                df = preprocess_videos_dataset(df)
+            
+            if df is None or df.empty:
+                logger.warning(f"Skipping {p.name}: no valid data after preprocessing")
+                continue
+            
             dataset_size_mb = get_dataset_size_mb(df)
             total_memory_mb += dataset_size_mb
             
@@ -578,7 +751,7 @@ def load_samples_optimized() -> Dict[str, pd.DataFrame]:
                 dataset_size_mb = get_dataset_size_mb(df)
             
             out[name] = df
-            logger.info(f"Loaded {p.name}: {len(df):,} rows, {dataset_size_mb:.1f}MB")
+            logger.info(f"Loaded {p.name} ({dataset_type}): {len(df):,} rows, {dataset_size_mb:.1f}MB")
             
             # Memory management
             if total_memory_mb > 500:  # 500MB threshold
@@ -592,57 +765,532 @@ def load_samples_optimized() -> Dict[str, pd.DataFrame]:
     return out
 
 # -----------------------------
+# Chunked Processing System
+# -----------------------------
+
+class ChunkedDataProcessor:
+    """
+    Advanced chunked processing system for handling large datasets efficiently.
+    Splits datasets into manageable chunks and processes them independently.
+    """
+    
+    def __init__(self, chunk_size: int = 50_000, memory_limit_mb: int = 500):
+        """
+        Initialize chunked processor.
+        
+        Args:
+            chunk_size: Number of rows per chunk
+            memory_limit_mb: Memory limit for adaptive chunk sizing
+        """
+        self.chunk_size = chunk_size
+        self.memory_limit_mb = memory_limit_mb
+        self.processed_chunks = 0
+        self.total_chunks = 0
+        
+    def calculate_optimal_chunk_size(self, df: pd.DataFrame) -> int:
+        """Calculate optimal chunk size based on memory usage."""
+        if len(df) < 1000:
+            return len(df)
+        
+        # Sample a small portion to estimate memory per row
+        sample_size = min(1000, len(df))
+        sample_df = df.head(sample_size)
+        memory_per_row_mb = get_dataset_size_mb(sample_df) / sample_size
+        
+        # Calculate chunk size that stays under memory limit
+        max_rows_per_chunk = int(self.memory_limit_mb / memory_per_row_mb)
+        optimal_chunk_size = min(max_rows_per_chunk, self.chunk_size)
+        
+        logger.info(f"Estimated {memory_per_row_mb:.4f}MB per row, using chunk size: {optimal_chunk_size:,}")
+        return max(1000, optimal_chunk_size)  # Minimum 1000 rows per chunk
+    
+    def create_chunks(self, df: pd.DataFrame) -> List[pd.DataFrame]:
+        """Split DataFrame into chunks efficiently."""
+        if df.empty:
+            return []
+        
+        optimal_chunk_size = self.calculate_optimal_chunk_size(df)
+        self.total_chunks = len(df) // optimal_chunk_size + (1 if len(df) % optimal_chunk_size > 0 else 0)
+        
+        chunks = []
+        for i in range(0, len(df), optimal_chunk_size):
+            chunk = df.iloc[i:i + optimal_chunk_size].copy()
+            chunks.append(chunk)
+        
+        logger.info(f"Created {len(chunks)} chunks with ~{optimal_chunk_size:,} rows each")
+        return chunks
+    
+    def process_chunk_hashtags(self, chunk: pd.DataFrame, label: str = '6h') -> Optional[pd.DataFrame]:
+        """Process a single chunk for hashtag aggregation."""
+        try:
+            self.processed_chunks += 1
+            logger.debug(f"Processing hashtag chunk {self.processed_chunks}/{self.total_chunks}")
+            
+            p = prepare_text_df_optimized(chunk)
+            if p is None or p.empty:
+                return None
+            
+            dataset_type = p['dataset_type'].iloc[0] if 'dataset_type' in p.columns else 'unknown'
+            
+            # Time binning
+            if label in _FREQ_MAP:
+                p['bin'] = p['ts'].dt.floor(_FREQ_MAP[label])
+            else:
+                p['bin'] = assign_time_bin_optimized(p['ts'], label)
+            
+            # Explode hashtags
+            pe = p[['bin', 'hashtags']].explode('hashtags').dropna(subset=['hashtags'])
+            if pe.empty:
+                return None
+            
+            pe = pe.rename(columns={'hashtags': 'feature'})
+            
+            # Apply engagement weighting if available
+            if 'engagement_score' in p.columns:
+                engagement_map = p.groupby('bin')['engagement_score'].mean().to_dict()
+                pe['engagement_weight'] = pe['bin'].map(engagement_map).fillna(1.0)
+                
+                if dataset_type == 'comments':
+                    pe['weighted_count'] = pe['engagement_weight']
+                else:
+                    pe['weighted_count'] = np.log1p(pe['engagement_weight'])
+            else:
+                pe['weighted_count'] = 1.0
+            
+            # Group and aggregate
+            g = pe.groupby(['bin', 'feature'], as_index=False).agg({
+                'weighted_count': 'sum'
+            }).rename(columns={'weighted_count': 'count'})
+            
+            g['count'] = g['count'].round().astype(int).clip(lower=1)
+            g['category'] = g['feature'].apply(categorize_feature)
+            g['source_type'] = dataset_type
+            
+            return g
+            
+        except Exception as e:
+            logger.error(f"Error processing hashtag chunk {self.processed_chunks}: {e}")
+            return None
+    
+    def process_chunk_keywords(self, chunk: pd.DataFrame, label: str = '6h') -> Optional[pd.DataFrame]:
+        """Process a single chunk for keyword aggregation."""
+        try:
+            self.processed_chunks += 1
+            logger.debug(f"Processing keyword chunk {self.processed_chunks}/{self.total_chunks}")
+            
+            p = prepare_text_df_optimized(chunk)
+            if p is None or p.empty:
+                return None
+            
+            dataset_type = p['dataset_type'].iloc[0] if 'dataset_type' in p.columns else 'unknown'
+            
+            # Pre-compile patterns for better performance
+            kw_patterns = [(kw, re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE)) for kw in KEYWORDS]
+            
+            if label in _FREQ_MAP:
+                p['bin'] = p['ts'].dt.floor(_FREQ_MAP[label])
+            else:
+                p['bin'] = assign_time_bin_optimized(p['ts'], label)
+            
+            frames = []
+            for kw, pat in kw_patterns:
+                mask = p['text_clean'].str.contains(pat, na=False)
+                if not mask.any():
+                    continue
+                
+                matched_data = p.loc[mask].copy()
+                
+                # Apply engagement weighting
+                if 'engagement_score' in matched_data.columns:
+                    if dataset_type == 'comments':
+                        matched_data['weight'] = matched_data['engagement_score']
+                    else:
+                        matched_data['weight'] = np.log1p(matched_data['engagement_score'])
+                else:
+                    matched_data['weight'] = 1.0
+                
+                g = matched_data.groupby('bin', as_index=False)['weight'].sum().rename(columns={'weight': 'count'})
+                g['count'] = g['count'].round().astype(int).clip(lower=1)
+                g['feature'] = kw
+                g['category'] = categorize_feature(kw)
+                g['source_type'] = dataset_type
+                frames.append(g)
+            
+            if not frames:
+                return None
+            
+            return pd.concat(frames, ignore_index=True)
+            
+        except Exception as e:
+            logger.error(f"Error processing keyword chunk {self.processed_chunks}: {e}")
+            return None
+    
+    def process_chunk_emerging_terms(self, chunk: pd.DataFrame, label: str = '6h') -> Optional[pd.DataFrame]:
+        """Process a single chunk for emerging terms detection."""
+        try:
+            self.processed_chunks += 1
+            logger.debug(f"Processing emerging terms chunk {self.processed_chunks}/{self.total_chunks}")
+            
+            p = prepare_text_df_optimized(chunk)
+            if p is None or p.empty:
+                return None
+            
+            dataset_type = p['dataset_type'].iloc[0] if 'dataset_type' in p.columns else 'unknown'
+            
+            # Extract terms with limits for performance
+            if dataset_type == 'videos':
+                p["all_terms"] = p["text_clean"].apply(
+                    lambda x: extract_all_terms_optimized(x, max_terms=25)
+                )
+            else:
+                p["all_terms"] = p["text_clean"].apply(
+                    lambda x: extract_all_terms_optimized(x, max_terms=15)
+                )
+            
+            if label in _FREQ_MAP:
+                p['bin'] = p['ts'].dt.floor(_FREQ_MAP[label])
+            else:
+                p['bin'] = assign_time_bin_optimized(p['ts'], label)
+            
+            # Explode and aggregate
+            pe = p[["bin", "all_terms"]].explode("all_terms").dropna(subset=["all_terms"])
+            if pe.empty:
+                return None
+            
+            pe = pe.rename(columns={"all_terms": "feature"})
+            
+            # Add engagement context
+            if 'engagement_score' in p.columns:
+                engagement_map = p.groupby('bin')['engagement_score'].mean().to_dict()
+                pe['weight'] = pe['bin'].map(engagement_map).fillna(1.0)
+                if dataset_type == 'videos':
+                    pe['weight'] = np.log1p(pe['weight'])
+            else:
+                pe['weight'] = 1.0
+            
+            result = pe.groupby(["bin", "feature"], as_index=False)['weight'].sum().rename(columns={'weight': 'count'})
+            result['count'] = result['count'].round().astype(int).clip(lower=1)
+            result['source_type'] = dataset_type
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error processing emerging terms chunk {self.processed_chunks}: {e}")
+            return None
+    
+    def process_dataset_chunked(self, df: pd.DataFrame, processing_func: callable, 
+                              label: str = '6h', feature_type: str = 'hashtags') -> Optional[pd.DataFrame]:
+        """
+        Process a large dataset using chunked approach.
+        
+        Args:
+            df: DataFrame to process
+            processing_func: Function to apply to each chunk
+            label: Time label for aggregation
+            feature_type: Type of features being processed
+        
+        Returns:
+            Combined results from all chunks
+        """
+        if df.empty:
+            return None
+        
+        logger.info(f"Starting chunked processing for {feature_type} ({label}): {len(df):,} rows")
+        
+        # Reset chunk counter
+        self.processed_chunks = 0
+        
+        # Create chunks
+        chunks = self.create_chunks(df)
+        if not chunks:
+            return None
+        
+        # Process chunks
+        chunk_results = []
+        with tqdm(total=len(chunks), desc=f"Processing {feature_type} chunks") as pbar:
+            for i, chunk in enumerate(chunks):
+                result = processing_func(chunk, label)
+                if result is not None and not result.empty:
+                    chunk_results.append(result)
+                
+                pbar.update(1)
+                
+                # Periodic garbage collection
+                if (i + 1) % 5 == 0:
+                    gc.collect()
+        
+        if not chunk_results:
+            logger.warning(f"No valid results from chunked processing of {feature_type}")
+            return None
+        
+        # Combine results
+        logger.info(f"Combining {len(chunk_results)} chunk results for {feature_type}")
+        combined_result = pd.concat(chunk_results, ignore_index=True)
+        
+        # Final aggregation to combine overlapping features across chunks
+        if 'bin' in combined_result.columns and 'feature' in combined_result.columns:
+            agg_cols = ['bin', 'feature']
+            if 'source_type' in combined_result.columns:
+                agg_cols.append('source_type')
+            
+            final_result = combined_result.groupby(agg_cols, as_index=False)['count'].sum()
+            
+            # Re-add other columns
+            for col in ['category', 'source_type']:
+                if col in combined_result.columns and col not in final_result.columns:
+                    col_map = combined_result.groupby(agg_cols[:-1] if col == 'source_type' else agg_cols)[col].first().to_dict()
+                    if col == 'source_type':
+                        final_result[col] = final_result[agg_cols[:-1]].apply(lambda x: col_map.get(tuple(x)), axis=1)
+                    else:
+                        final_result[col] = final_result[agg_cols].apply(lambda x: col_map.get(tuple(x)), axis=1)
+        else:
+            final_result = combined_result
+        
+        logger.info(f"Chunked processing complete: {len(final_result):,} final {feature_type} features")
+        return final_result
+
+# Global chunked processor instance
+chunked_processor = ChunkedDataProcessor(
+    chunk_size=CONFIG.get("chunk_size", 50_000),
+    memory_limit_mb=CONFIG.get("chunk_memory_limit_mb", 300)
+)
+
+def process_dataset_with_chunking(name: str, df: pd.DataFrame, 
+                                processing_type: str = 'hashtags', 
+                                label: str = '6h') -> Optional[pd.DataFrame]:
+    """
+    Process a dataset using chunked approach if it's large enough.
+    
+    Args:
+        name: Dataset name for logging
+        df: DataFrame to process
+        processing_type: Type of processing ('hashtags', 'keywords', 'emerging_terms')
+        label: Time label for aggregation
+    
+    Returns:
+        Processed results
+    """
+    if df.empty:
+        return None
+    
+    # Determine if chunking is beneficial
+    dataset_size_mb = get_dataset_size_mb(df)
+    threshold_rows = CONFIG.get("chunking_threshold_rows", 100_000)
+    should_chunk = (len(df) > threshold_rows) or (dataset_size_mb > 200)  # Configurable threshold
+    
+    if not should_chunk:
+        # Use original functions for smaller datasets
+        if processing_type == 'hashtags':
+            return aggregate_hashtags_dataset_aware(name, df, label)
+        elif processing_type == 'keywords':
+            return aggregate_keywords_dataset_aware(name, df, label)
+        else:
+            logger.warning(f"Unsupported processing type for small dataset: {processing_type}")
+            return None
+    
+    # Use chunked processing for large datasets
+    logger.info(f"Using chunked processing for {name}: {len(df):,} rows, {dataset_size_mb:.1f}MB")
+    
+    if processing_type == 'hashtags':
+        return chunked_processor.process_dataset_chunked(
+            df, chunked_processor.process_chunk_hashtags, label, 'hashtags'
+        )
+    elif processing_type == 'keywords':
+        return chunked_processor.process_dataset_chunked(
+            df, chunked_processor.process_chunk_keywords, label, 'keywords'
+        )
+    elif processing_type == 'emerging_terms':
+        return chunked_processor.process_dataset_chunked(
+            df, chunked_processor.process_chunk_emerging_terms, label, 'emerging_terms'
+        )
+    else:
+        logger.error(f"Unsupported processing type: {processing_type}")
+        return None
+
+def aggregate_emerging_terms_chunked(dfs: List[Tuple[str, pd.DataFrame]], 
+                                   label: str = '6h',
+                                   min_growth_rate: float = 2.0) -> pd.DataFrame:
+    """
+    Enhanced emerging terms detection with chunked processing for large datasets.
+    
+    Args:
+        dfs: List of (name, dataframe) tuples to process
+        label: Time label for aggregation
+        min_growth_rate: Minimum growth rate to consider a term emerging
+    
+    Returns:
+        DataFrame with emerging trends, using chunked processing for large datasets
+    """
+    min_frequency = _MIN_FREQ_BY_LABEL.get(label, 3)
+    
+    logger.info(f"Computing chunked emerging terms for {label} with {len(dfs)} sources")
+    
+    # Process each source with chunked approach if needed
+    source_results = []
+    for name, df in dfs:
+        if CONFIG["sample_rows_per_source"] and len(df) > CONFIG["sample_rows_per_source"]:
+            df = sample_large_dataset(df, CONFIG["sample_rows_per_source"])
+        
+        # Use chunked processing for large datasets
+        if CONFIG.get("enable_chunking", True):
+            result = process_dataset_with_chunking(name, df, 'emerging_terms', label)
+        else:
+            # Fallback to original method for smaller datasets or when chunking disabled
+            p = prepare_text_df_optimized(df)
+            if p is None or p.empty:
+                continue
+            
+            dataset_type = p['dataset_type'].iloc[0] if 'dataset_type' in p.columns else 'unknown'
+            
+            if dataset_type == 'videos':
+                p["all_terms"] = p["text_clean"].apply(
+                    lambda x: extract_all_terms_optimized(x, max_terms=25)
+                )
+            else:
+                p["all_terms"] = p["text_clean"].apply(
+                    lambda x: extract_all_terms_optimized(x, max_terms=15)
+                )
+            
+            if label in _FREQ_MAP:
+                p['bin'] = p['ts'].dt.floor(_FREQ_MAP[label])
+            else:
+                p['bin'] = assign_time_bin_optimized(p['ts'], label)
+            
+            pe = p[["bin", "all_terms"]].explode("all_terms").dropna(subset=["all_terms"])
+            if pe.empty:
+                continue
+            
+            pe = pe.rename(columns={"all_terms": "feature"})
+            
+            if 'engagement_score' in p.columns:
+                engagement_map = p.groupby('bin')['engagement_score'].mean().to_dict()
+                pe['weight'] = pe['bin'].map(engagement_map).fillna(1.0)
+                if dataset_type == 'videos':
+                    pe['weight'] = np.log1p(pe['weight'])
+            else:
+                pe['weight'] = 1.0
+            
+            result = pe.groupby(["bin", "feature"], as_index=False)['weight'].sum().rename(columns={'weight': 'count'})
+            result['count'] = result['count'].round().astype(int).clip(lower=1)
+            result['source_type'] = dataset_type
+        
+        if result is not None and not result.empty:
+            source_results.append(result)
+    
+    if not source_results:
+        return pd.DataFrame(columns=["bin", "feature", "count", "growth_rate", "is_emerging", "velocity", "category", "source_type"])
+    
+    # Combine all results
+    allg = pd.concat(source_results, ignore_index=True)
+    allg = allg.groupby(["bin", "feature", "source_type"], as_index=False)["count"].sum()
+    
+    # Filter rare terms early for performance
+    total_counts = allg.groupby(["feature", "source_type"])["count"].sum()
+    frequent_terms = total_counts[total_counts >= min_frequency].index
+    
+    # Convert to set for faster lookup
+    frequent_set = set((feat, src) for feat, src in frequent_terms)
+    allg = allg[allg.apply(lambda row: (row['feature'], row['source_type']) in frequent_set, axis=1)]
+    
+    # Apply feature limits for performance
+    if CONFIG["max_features_emerging"] and len(allg['feature'].unique()) > CONFIG["max_features_emerging"]:
+        top_features = allg.groupby('feature')['count'].sum().nlargest(CONFIG["max_features_emerging"]).index
+        allg = allg[allg['feature'].isin(top_features)]
+        logger.info(f"Limited to top {len(top_features)} emerging terms for performance")
+    
+    if allg.empty:
+        return pd.DataFrame(columns=["bin", "feature", "count", "growth_rate", "is_emerging", "velocity", "category", "source_type"])
+    
+    # Optimized growth rate calculation by source type
+    allg = allg.sort_values(["feature", "source_type", "bin"]).reset_index(drop=True)
+    allg['prev_count'] = allg.groupby(['feature', 'source_type'])['count'].shift(1)
+    allg['growth_rate'] = allg['count'] / (allg['prev_count'] + 1e-6)
+    allg.loc[allg['prev_count'].isna(), 'growth_rate'] = 1.0
+    
+    # Identify emerging terms with dataset-aware thresholds
+    video_mask = allg['source_type'] == 'videos'
+    comment_mask = allg['source_type'] == 'comments'
+    
+    allg.loc[video_mask, "is_emerging"] = allg.loc[video_mask, "growth_rate"] >= (min_growth_rate * 1.2)
+    allg.loc[comment_mask, "is_emerging"] = allg.loc[comment_mask, "growth_rate"] >= min_growth_rate
+    
+    allg["category"] = allg["feature"].apply(categorize_feature)
+    
+    # Apply relevance filtering for Beauty/Fashion/Skincare/Makeup/Hair
+    logger.info("Applying chunked relevance filtering for Beauty/Fashion/Skincare/Makeup/Hair trends")
+    allg = filter_relevant_emerging_terms(allg)
+    
+    # Velocity calculation (expensive, controlled by config)
+    if CONFIG["compute_velocity"] and label == '6h':
+        logger.info("Computing chunked velocities for emerging terms")
+        velocities = {}
+        emerging_features = allg[allg["is_emerging"]]["feature"].unique()
+        
+        for term in tqdm(emerging_features, desc="Computing velocities"):
+            term_data = allg[allg['feature'] == term]
+            velocity = calculate_term_velocity_optimized(term_data, term)
+            velocities[term] = velocity
+        
+        allg["velocity"] = allg["feature"].map(velocities).fillna(0.0)
+    else:
+        allg["velocity"] = 0.0
+    
+    return allg
+
+# -----------------------------
 # Enhanced Data Preparation
 # -----------------------------
 
 def prepare_text_df_optimized(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    """Optimized text DataFrame preparation."""
+    """Optimized text DataFrame preparation for standardized comment/video datasets."""
     if df.empty:
         return None
         
-    # Find timestamp column efficiently
-    ts_candidates = [c for c in df.columns if any(k in c.lower() for k in ["time", "date", "created", "upload", "posted"])]
-    ts_col = None
-    
-    for c in ts_candidates:
-        try:
-            pd.to_datetime(df[c].iloc[:100])  # Test with sample
-            ts_col = c
-            break
-        except Exception:
-            continue
-    
-    if not ts_col:
+    # Use standardized columns from preprocessing
+    if 'timestamp' not in df.columns or 'text' not in df.columns:
+        logger.warning("Dataset missing standardized 'timestamp' or 'text' columns")
         return None
     
-    # Find text columns efficiently
-    txt_candidates = ["text", "comment", "caption", "title", "description", "body", "content"]
-    txt_cols = [c for c in txt_candidates if c in df.columns]
-    if not txt_cols:
-        txt_cols = [c for c in df.columns if df[c].dtype == 'object'][:2]
+    # Optimize column selection with standardized schema
+    use = df[['timestamp', 'text']].copy()
     
-    if not txt_cols:
-        return None
+    # Add engagement and dataset type info if available
+    if 'engagement_score' in df.columns:
+        use['engagement_score'] = df['engagement_score']
+    if 'dataset_type' in df.columns:
+        use['dataset_type'] = df['dataset_type']
+    if 'is_reply' in df.columns:
+        use['is_reply'] = df['is_reply']
+    if 'video_id' in df.columns:
+        use['video_id'] = df['video_id']
     
-    # Optimize column selection
-    use = df[[ts_col] + txt_cols].copy()
-    
-    # Vectorized timestamp conversion
-    use["ts"] = pd.to_datetime(use[ts_col], errors='coerce')
+    # Use the already processed timestamp
+    use["ts"] = use["timestamp"]
     use = use.dropna(subset=["ts"])
     
     if use.empty:
         return None
     
     # Optimized text processing
-    use["text_raw"] = use[txt_cols].fillna('').astype(str).agg(" ".join, axis=1)
+    use["text_raw"] = use["text"].astype(str)
     
     # Batch text cleaning for better performance
     logger.info(f"Processing {len(use):,} text records")
     use["text_clean"] = use["text_raw"].apply(clean_text_optimized)
     use["hashtags"] = use["text_raw"].apply(extract_hashtags_optimized)
     
-    return use[["ts", "text_clean", "hashtags"]]
+    # Select final columns
+    final_cols = ["ts", "text_clean", "hashtags"]
+    if 'engagement_score' in use.columns:
+        final_cols.append('engagement_score')
+    if 'dataset_type' in use.columns:
+        final_cols.append('dataset_type')
+    if 'is_reply' in use.columns:
+        final_cols.append('is_reply')
+    if 'video_id' in use.columns:
+        final_cols.append('video_id')
+    
+    return use[final_cols]
 
 # -----------------------------
 # Parallel Processing Functions
@@ -693,6 +1341,231 @@ def parallel_process_sources(sources: List[Tuple[str, pd.DataFrame]],
                 logger.error(f"Failed to process source {source_name}: {e}")
     
     return results
+
+# -----------------------------
+# Dataset-Specific Aggregation Functions
+# -----------------------------
+
+def aggregate_hashtags_dataset_aware(name: str, df: pd.DataFrame, label: str = '6h') -> Optional[pd.DataFrame]:
+    """Dataset-aware hashtag aggregation optimized for comments vs videos."""
+    p = prepare_text_df_optimized(df)
+    if p is None or p.empty:
+        return None
+    
+    dataset_type = p['dataset_type'].iloc[0] if 'dataset_type' in p.columns else 'unknown'
+    
+    # Efficient time binning
+    if label in _FREQ_MAP:
+        p['bin'] = p['ts'].dt.floor(_FREQ_MAP[label])
+    else:
+        p['bin'] = assign_time_bin_optimized(p['ts'], label)
+    
+    # Explode hashtags efficiently
+    pe = p[['bin', 'hashtags']].explode('hashtags').dropna(subset=['hashtags'])
+    if pe.empty:
+        return None
+    
+    pe = pe.rename(columns={'hashtags': 'feature'})
+    
+    # Add engagement weighting if available
+    if 'engagement_score' in p.columns:
+        # Merge engagement scores back
+        engagement_map = p.groupby('bin')['engagement_score'].mean().to_dict()
+        pe['engagement_weight'] = pe['bin'].map(engagement_map).fillna(1.0)
+        
+        # Apply engagement weighting (comments get linear weight, videos get log weight)
+        if dataset_type == 'comments':
+            pe['weighted_count'] = pe['engagement_weight'].apply(lambda x: min(x / 10, 5))  # Cap at 5x
+        else:  # videos
+            pe['weighted_count'] = pe['engagement_weight'].apply(lambda x: np.log1p(x / 1000))  # Log scale for views
+    else:
+        pe['weighted_count'] = 1.0
+    
+    # Group and aggregate with weighting
+    g = pe.groupby(['bin', 'feature'], as_index=False).agg({
+        'weighted_count': 'sum'
+    }).rename(columns={'weighted_count': 'count'})
+    
+    # Round counts and ensure minimum of 1
+    g['count'] = g['count'].round().astype(int).clip(lower=1)
+    
+    g['category'] = g['feature'].apply(categorize_feature)
+    g['source_type'] = dataset_type
+    
+    return g
+
+def aggregate_keywords_dataset_aware(name: str, df: pd.DataFrame, label: str = '6h') -> Optional[pd.DataFrame]:
+    """Dataset-aware keyword aggregation optimized for comments vs videos."""
+    p = prepare_text_df_optimized(df)
+    if p is None or p.empty:
+        return None
+    
+    dataset_type = p['dataset_type'].iloc[0] if 'dataset_type' in p.columns else 'unknown'
+    
+    # Pre-compile patterns for better performance
+    kw_patterns = [(kw, re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE)) for kw in KEYWORDS]
+    
+    if label in _FREQ_MAP:
+        p['bin'] = p['ts'].dt.floor(_FREQ_MAP[label])
+    else:
+        p['bin'] = assign_time_bin_optimized(p['ts'], label)
+    
+    frames = []
+    for kw, pat in kw_patterns:
+        mask = p['text_clean'].str.contains(pat, na=False)
+        if not mask.any():
+            continue
+        
+        matched_data = p.loc[mask].copy()
+        
+        # Apply engagement weighting for dataset-specific aggregation
+        if 'engagement_score' in matched_data.columns:
+            if dataset_type == 'comments':
+                # For comments, weight by like count (linear)
+                matched_data['weight'] = matched_data['engagement_score'].apply(lambda x: min(x / 5, 10))
+            else:
+                # For videos, weight by comprehensive engagement (log scale)
+                matched_data['weight'] = matched_data['engagement_score'].apply(lambda x: np.log1p(x / 1000))
+        else:
+            matched_data['weight'] = 1.0
+        
+        g = matched_data.groupby('bin', as_index=False)['weight'].sum().rename(columns={'weight': 'count'})
+        g['count'] = g['count'].round().astype(int).clip(lower=1)
+        g['feature'] = kw
+        g['category'] = categorize_feature(kw)
+        g['source_type'] = dataset_type
+        frames.append(g)
+    
+    if not frames:
+        return None
+    
+    return pd.concat(frames, ignore_index=True)
+
+def aggregate_emerging_terms_dataset_aware(dfs: List[Tuple[str, pd.DataFrame]], 
+                                         label: str = '6h',
+                                         min_growth_rate: float = 2.0) -> pd.DataFrame:
+    """Dataset-aware emerging terms detection with separate processing for comments and videos."""
+    
+    min_frequency = _MIN_FREQ_BY_LABEL.get(label, 3)
+    
+    logger.info(f"Computing dataset-aware emerging terms for {label} with {len(dfs)} sources")
+    
+    def process_emerging_source_aware(name: str, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        if CONFIG["sample_rows_per_source"] and len(df) > CONFIG["sample_rows_per_source"]:
+            df = sample_large_dataset(df, CONFIG["sample_rows_per_source"])
+        
+        p = prepare_text_df_optimized(df)
+        if p is None or p.empty:
+            return None
+        
+        dataset_type = p['dataset_type'].iloc[0] if 'dataset_type' in p.columns else 'unknown'
+        
+        # Extract terms with limits for performance, adjusted by dataset type
+        if dataset_type == 'videos':
+            # Videos have richer content, extract more terms
+            p["all_terms"] = p["text_clean"].apply(
+                lambda x: extract_all_terms_optimized(x, max_terms=40)
+            )
+        else:
+            # Comments are typically shorter
+            p["all_terms"] = p["text_clean"].apply(
+                lambda x: extract_all_terms_optimized(x, max_terms=20)
+            )
+        
+        if label in _FREQ_MAP:
+            p["bin"] = p["ts"].dt.floor(_FREQ_MAP[label])
+        else:
+            p["bin"] = assign_time_bin_optimized(p["ts"], label)
+        
+        # Explode and aggregate with engagement weighting
+        pe = p[["bin", "all_terms"]].explode("all_terms").dropna(subset=["all_terms"])
+        if pe.empty:
+            return None
+        
+        pe = pe.rename(columns={"all_terms": "feature"})
+        
+        # Add engagement context back
+        if 'engagement_score' in p.columns:
+            engagement_map = p.set_index('bin')['engagement_score'].to_dict()
+            pe['engagement'] = pe['bin'].map(engagement_map).fillna(1.0)
+            
+            # Weight by engagement differently for each dataset type
+            if dataset_type == 'comments':
+                pe['weight'] = pe['engagement'].apply(lambda x: min(np.sqrt(x), 5))
+            else:  # videos
+                pe['weight'] = pe['engagement'].apply(lambda x: np.log1p(x / 100))
+        else:
+            pe['weight'] = 1.0
+        
+        result = pe.groupby(["bin", "feature"], as_index=False)['weight'].sum().rename(columns={'weight': 'count'})
+        result['count'] = result['count'].round().astype(int).clip(lower=1)
+        result['source_type'] = dataset_type
+        
+        return result
+    
+    # Process sources (potentially in parallel)
+    frames = parallel_process_sources(dfs, process_emerging_source_aware)
+    
+    if not frames:
+        return pd.DataFrame(columns=["bin", "feature", "count", "growth_rate", "is_emerging", "velocity", "category", "source_type"])
+    
+    # Combine all data
+    allg = pd.concat(frames, ignore_index=True)
+    
+    # Aggregate by source type to preserve dataset characteristics
+    allg = allg.groupby(["bin", "feature", "source_type"], as_index=False)["count"].sum()
+    
+    # Filter rare terms early for performance
+    total_counts = allg.groupby(["feature", "source_type"])["count"].sum()
+    frequent_terms = total_counts[total_counts >= min_frequency].index
+    
+    # Convert to set for faster lookup
+    frequent_set = set((feat, src) for feat, src in frequent_terms)
+    allg = allg[allg.apply(lambda row: (row['feature'], row['source_type']) in frequent_set, axis=1)]
+    
+    # Apply feature limits for performance
+    if CONFIG["max_features_emerging"] and len(allg['feature'].unique()) > CONFIG["max_features_emerging"]:
+        top_features = allg.groupby('feature')['count'].sum().nlargest(CONFIG["max_features_emerging"]).index
+        allg = allg[allg['feature'].isin(top_features)]
+        logger.info(f"Limited to top {len(top_features)} emerging terms for performance")
+    
+    if allg.empty:
+        return pd.DataFrame(columns=["bin", "feature", "count", "growth_rate", "is_emerging", "velocity", "category", "source_type"])
+    
+    # Optimized growth rate calculation by source type
+    allg = allg.sort_values(["feature", "source_type", "bin"]).reset_index(drop=True)
+    allg['prev_count'] = allg.groupby(['feature', 'source_type'])['count'].shift(1)
+    allg['growth_rate'] = allg['count'] / (allg['prev_count'] + 1e-6)
+    allg.loc[allg['prev_count'].isna(), 'growth_rate'] = 1.0
+    
+    # Identify emerging terms with dataset-aware thresholds
+    # Videos typically have more stable trends, so use slightly higher thresholds
+    video_mask = allg['source_type'] == 'videos'
+    comment_mask = allg['source_type'] == 'comments'
+    
+    allg.loc[video_mask, "is_emerging"] = allg.loc[video_mask, "growth_rate"] >= (min_growth_rate * 1.2)
+    allg.loc[comment_mask, "is_emerging"] = allg.loc[comment_mask, "growth_rate"] >= min_growth_rate
+    
+    allg["category"] = allg["feature"].apply(categorize_feature)
+    
+    # Apply relevance filtering for Beauty/Fashion/Skincare/Makeup/Hair
+    logger.info("Applying dataset-aware relevance filtering for Beauty/Fashion/Skincare/Makeup/Hair trends")
+    allg = filter_relevant_emerging_terms(allg)
+    
+    # Velocity calculation (expensive, controlled by config)
+    if CONFIG["compute_velocity"] and label == '6h':
+        logger.info("Computing dataset-aware velocities for emerging terms")
+        velocities = {}
+        emerging_features = allg[allg["is_emerging"]]["feature"].unique()
+        
+        for term in tqdm(emerging_features, desc="Computing velocities"):
+            velocities[term] = calculate_term_velocity_optimized(allg, term)
+        
+        allg["velocity"] = allg["feature"].map(velocities).fillna(0.0)
+    else:
+        allg["velocity"] = 0.0
+    
+    return allg
 
 # -----------------------------
 # Optimized Aggregation Functions
@@ -802,11 +1675,11 @@ def aggregate_emerging_terms_optimized(dfs: List[Tuple[str, pd.DataFrame]],
     cache_key = f"emerging_terms_{data_fingerprint}"
     
     # Check cache first
-    if CONFIG["enable_caching"]:
-        cached_result = cache.get(cache_key, data_fingerprint)
-        if cached_result is not None:
-            logger.info(f"Using cached emerging terms for {label}")
-            return cached_result
+    # if CONFIG["enable_caching"]:
+    #     cached_result = cache.get(cache_key, data_fingerprint)
+    #     if cached_result is not None:
+    #         logger.info(f"Using cached emerging terms for {label}")
+    #         return cached_result
     
     logger.info(f"Computing emerging terms for {label} with {len(dfs)} sources")
     
@@ -1216,67 +2089,88 @@ def write_phase3_emerging_trends_report(emerging_df: pd.DataFrame,
 # -----------------------------
 
 def main_optimized():
-    """Main optimized data processing pipeline."""
+    """Main optimized data processing pipeline with dataset-aware processing."""
     start_time = time.time()
-    logger.info(f"Starting optimized data processing pipeline in {PERFORMANCE_MODE} mode")
+    logger.info(f"Starting dataset-aware optimized data processing pipeline in {PERFORMANCE_MODE} mode")
     
-    # Load data with optimization
+    # Load data with optimization and dataset type separation
     samples = load_samples_optimized()
     if not samples:
         logger.error("No data samples found")
         return
     
-    # Choose text sources
-    text_sources = []
+    # Separate comment and video sources for optimized processing
+    comment_sources = []
+    video_sources = []
+    
     for name, df in samples.items():
-        if any(tok in name.lower() for tok in ["comment", "video"]):
-            text_sources.append((name, df))
+        if 'dataset_type' in df.columns:
+            if df['dataset_type'].iloc[0] == 'comments':
+                comment_sources.append((name, df))
+            else:
+                video_sources.append((name, df))
+        else:
+            # Fallback based on filename
+            if any(tok in name.lower() for tok in ["comment"]):
+                comment_sources.append((name, df))
+            elif any(tok in name.lower() for tok in ["video"]):
+                video_sources.append((name, df))
+            else:
+                # Default to comment processing for unknown types
+                comment_sources.append((name, df))
     
-    if not text_sources:
-        text_sources = list(samples.items())
+    logger.info(f"Processing {len(comment_sources)} comment sources and {len(video_sources)} video sources")
     
-    logger.info(f"Processing {len(text_sources)} text sources")
+    # Phase 2: Baseline 6h aggregations with dataset awareness and chunked processing
+    logger.info("Phase 2: Running dataset-aware baseline 6h aggregations with chunked processing")
     
-    # Phase 2: Baseline 6h aggregations
-    logger.info("Phase 2: Running baseline 6h aggregations")
+    def process_hashtags_6h_chunked(name: str, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """Process hashtags with automatic chunking for large datasets."""
+        if CONFIG.get("enable_chunking", True):
+            return process_dataset_with_chunking(name, df, 'hashtags', '6h')
+        else:
+            return aggregate_hashtags_dataset_aware(name, df, '6h')
     
-    def process_hashtags_6h(name: str, df: pd.DataFrame) -> Optional[pd.DataFrame]:
-        return aggregate_hashtags_optimized(name, df, '6h')
+    def process_keywords_6h_chunked(name: str, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """Process keywords with automatic chunking for large datasets."""
+        if CONFIG.get("enable_chunking", True):
+            return process_dataset_with_chunking(name, df, 'keywords', '6h')
+        else:
+            return aggregate_keywords_dataset_aware(name, df, '6h')
     
-    def process_keywords_6h(name: str, df: pd.DataFrame) -> Optional[pd.DataFrame]:
-        return aggregate_keywords_optimized(name, df, '6h')
+    # Process baseline aggregations for comments and videos separately
+    all_sources = comment_sources + video_sources
     
-    # Process baseline aggregations
-    hashtag_frames = parallel_process_sources(text_sources, process_hashtags_6h)
-    keyword_frames = parallel_process_sources(text_sources, process_keywords_6h)
+    hashtag_frames = parallel_process_sources(all_sources, process_hashtags_6h_chunked)
+    keyword_frames = parallel_process_sources(all_sources, process_keywords_6h_chunked)
     
     # Combine and process results
     ts_hashtags = pd.concat(hashtag_frames, ignore_index=True) if hashtag_frames else pd.DataFrame()
     ts_keywords = pd.concat(keyword_frames, ignore_index=True) if keyword_frames else pd.DataFrame()
     
     if not ts_hashtags.empty:
-        ts_hashtags = ts_hashtags.groupby(['bin', 'feature', 'category'], as_index=False)['count'].sum()
+        # Group by bin, feature, category, and source_type to preserve dataset distinctions
+        ts_hashtags = ts_hashtags.groupby(['bin', 'feature', 'category', 'source_type'], as_index=False)['count'].sum()
         ts_hashtags = add_rolling_stats_optimized(ts_hashtags, '6h')
     
     if not ts_keywords.empty:
-        ts_keywords = ts_keywords.groupby(['bin', 'feature', 'category'], as_index=False)['count'].sum()
+        ts_keywords = ts_keywords.groupby(['bin', 'feature', 'category', 'source_type'], as_index=False)['count'].sum()
         ts_keywords = add_rolling_stats_optimized(ts_keywords, '6h')
     
-    # Empty audio for sample data
-    ts_audio = pd.DataFrame(columns=['bin', 'feature', 'count', 'rolling_mean_24h', 'delta_vs_mean', 'category'])
+    # Empty audio for sample data (not applicable to this dataset)
+    ts_audio = pd.DataFrame(columns=['bin', 'feature', 'count', 'rolling_mean_24h', 'delta_vs_mean', 'category', 'source_type'])
     
-    # Save baseline results
+    # Save baseline results with dataset type information
     if not ts_hashtags.empty:
         ts_hashtags.to_parquet(PROC_DIR / 'features_hashtags_6h.parquet', index=False)
-        logger.info(f"Saved hashtags: {len(ts_hashtags):,} rows")
+        logger.info(f"Saved hashtags: {len(ts_hashtags):,} rows across {ts_hashtags['source_type'].nunique()} source types")
     
     if not ts_keywords.empty:
         ts_keywords.to_parquet(PROC_DIR / 'features_keywords_6h.parquet', index=False)
-        logger.info(f"Saved keywords: {len(ts_keywords):,} rows")
+        logger.info(f"Saved keywords: {len(ts_keywords):,} rows across {ts_keywords['source_type'].nunique()} source types")
     
-    # Multi-timeframe processing
-    logger.info("Phase 2: Running multi-timeframe aggregations")
-    all_sources = list(samples.items())
+    # Multi-timeframe processing with dataset awareness and chunked processing
+    logger.info("Phase 2: Running multi-timeframe dataset-aware aggregations with chunked processing")
     
     for label in TIMEFRAME_LABELS:
         if label == '6h':
@@ -1284,30 +2178,38 @@ def main_optimized():
         
         logger.info(f"Processing timeframe: {label}")
         
-        def process_hashtags_tf(name: str, df: pd.DataFrame) -> Optional[pd.DataFrame]:
-            return aggregate_hashtags_optimized(name, df, label)
+        def process_hashtags_tf_chunked(name: str, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+            """Process hashtags with automatic chunking for current timeframe."""
+            if CONFIG.get("enable_chunking", True):
+                return process_dataset_with_chunking(name, df, 'hashtags', label)
+            else:
+                return aggregate_hashtags_dataset_aware(name, df, label)
         
-        def process_keywords_tf(name: str, df: pd.DataFrame) -> Optional[pd.DataFrame]:
-            return aggregate_keywords_optimized(name, df, label)
+        def process_keywords_tf_chunked(name: str, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+            """Process keywords with automatic chunking for current timeframe."""
+            if CONFIG.get("enable_chunking", True):
+                return process_dataset_with_chunking(name, df, 'keywords', label)
+            else:
+                return aggregate_keywords_dataset_aware(name, df, label)
         
         # Check if files already exist
         h_file = f'features_hashtags_{label}.parquet'
         k_file = f'features_keywords_{label}.parquet'
         
         if not (PROC_DIR / h_file).exists():
-            h_frames = parallel_process_sources(all_sources, process_hashtags_tf)
+            h_frames = parallel_process_sources(all_sources, process_hashtags_tf_chunked)
             if h_frames:
                 h_combined = pd.concat(h_frames, ignore_index=True)
-                h_combined = h_combined.groupby(['bin', 'feature', 'category'], as_index=False)['count'].sum()
+                h_combined = h_combined.groupby(['bin', 'feature', 'category', 'source_type'], as_index=False)['count'].sum()
                 h_combined = add_rolling_stats_optimized(h_combined, label)
                 h_combined.to_parquet(PROC_DIR / h_file, index=False)
                 logger.info(f"Saved {h_file}: {len(h_combined):,} rows")
         
         if not (PROC_DIR / k_file).exists():
-            k_frames = parallel_process_sources(all_sources, process_keywords_tf)
+            k_frames = parallel_process_sources(all_sources, process_keywords_tf_chunked)
             if k_frames:
                 k_combined = pd.concat(k_frames, ignore_index=True)
-                k_combined = k_combined.groupby(['bin', 'feature', 'category'], as_index=False)['count'].sum()
+                k_combined = k_combined.groupby(['bin', 'feature', 'category', 'source_type'], as_index=False)['count'].sum()
                 k_combined = add_rolling_stats_optimized(k_combined, label)
                 k_combined.to_parquet(PROC_DIR / k_file, index=False)
                 logger.info(f"Saved {k_file}: {len(k_combined):,} rows")
@@ -1337,8 +2239,8 @@ def main_optimized():
     }
     write_enhanced_phase2_report(all_timeframe_data)
     
-    # Phase 3: Multi-timeframe emerging trends detection
-    logger.info("Phase 3: Running multi-timeframe emerging trends detection")
+    # Phase 3: Multi-timeframe emerging trends detection with chunked processing
+    logger.info("Phase 3: Running multi-timeframe dataset-aware emerging trends detection with chunked processing")
     emerging_frames = []
     for label in TIMEFRAME_LABELS:
         # Use growth rate threshold per timeframe
@@ -1348,41 +2250,57 @@ def main_optimized():
             df_em = pd.read_parquet(fname)
             logger.info(f"Loaded existing emerging terms {label}: {len(df_em):,} rows")
         else:
-            df_em = aggregate_emerging_terms_optimized(all_sources, label, min_growth_rate=growth_thr)
+            # Use chunked emerging terms processing for large datasets
+            if CONFIG.get("enable_chunking", True):
+                df_em = aggregate_emerging_terms_chunked(all_sources, label, min_growth_rate=growth_thr)
+            else:
+                df_em = aggregate_emerging_terms_dataset_aware(all_sources, label, min_growth_rate=growth_thr)
+            
             if not df_em.empty:
                 df_em.to_parquet(fname, index=False)
                 logger.info(f"Saved emerging terms {label}: {len(df_em):,} rows (thr={growth_thr})")
+        
         if not df_em.empty:
             df_em = df_em.copy()
             df_em['timeframe'] = label
             emerging_frames.append(df_em)
+    
     if emerging_frames:
         ts_emerging_multi = pd.concat(emerging_frames, ignore_index=True)
     else:
         ts_emerging_multi = pd.DataFrame()
 
-    # Write Phase 3 emerging trends report (multi timeframe aware)
+    # Write Phase 3 emerging trends report (multi timeframe and dataset aware)
     try:
         write_phase3_emerging_trends_report(ts_emerging_multi, ts_hashtags, ts_keywords)
     except Exception as e:
         logger.warning(f"Failed to write Phase 3 emerging trends report: {e}")
     
-    # Performance summary
+    # Performance summary with dataset insights
     end_time = time.time()
     duration = end_time - start_time
     
-    logger.info("Pipeline completed successfully!")
+    logger.info("Dataset-aware pipeline completed successfully!")
     logger.info(f"Total execution time: {duration:.2f} seconds")
     logger.info(f"Performance mode: {PERFORMANCE_MODE}")
+    logger.info(f"Chunked processing: {'Enabled' if CONFIG.get('enable_chunking', True) else 'Disabled'}")
+    logger.info(f"Chunk size: {CONFIG.get('chunk_size', 50_000):,} rows")
     logger.info(f"Memory usage: {psutil.Process().memory_info().rss / 1024 / 1024:.1f} MB")
+    logger.info(f"Processed {len(comment_sources)} comment sources and {len(video_sources)} video sources")
     
-    # Performance report
+    # Enhanced performance report with dataset breakdown and chunked processing info
     perf_report = {
         'execution_time_seconds': duration,
         'performance_mode': PERFORMANCE_MODE,
         'parallel_processing': CONFIG['enable_parallel'],
         'caching_enabled': CONFIG['enable_caching'],
+        'chunked_processing_enabled': CONFIG.get('enable_chunking', True),
+        'chunk_size': CONFIG.get('chunk_size', 50_000),
+        'chunk_memory_limit_mb': CONFIG.get('chunk_memory_limit_mb', 300),
+        'chunking_threshold_rows': CONFIG.get('chunking_threshold_rows', 100_000),
         'total_sources_processed': len(all_sources),
+        'comment_sources': len(comment_sources),
+        'video_sources': len(video_sources),
         'files_generated': len(list(PROC_DIR.glob('features_*.parquet'))),
         'memory_usage_mb': psutil.Process().memory_info().rss / 1024 / 1024,
         'timestamp': pd.Timestamp.now().isoformat()
