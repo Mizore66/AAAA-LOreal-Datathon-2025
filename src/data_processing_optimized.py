@@ -205,6 +205,23 @@ def is_trend_relevant(feature: str, category: str = None) -> bool:
     if not isinstance(feature, str):
         return False
     
+    # Normalize the feature
+    f = feature.lstrip('#').lower()
+    
+    # Quick exclusion filter for clearly irrelevant terms
+    irrelevant_patterns = [
+        "technology", "tech", "gaming", "game", "sport", "politics", "political",
+        "news", "food", "recipe", "cooking", "travel", "vacation", "study", "work",
+        "job", "career", "finance", "money", "crypto", "stock", "investment",
+        "education", "school", "university", "medical", "health", "fitness", "gym",
+        "workout", "exercise", "diet", "nutrition", "weight loss"
+    ]
+    
+    # If any irrelevant patterns are found, exclude immediately
+    for pattern in irrelevant_patterns:
+        if pattern in f:
+            return False
+    
     # Use provided category or compute it
     if category is None:
         category = categorize_feature(feature)
@@ -214,8 +231,6 @@ def is_trend_relevant(feature: str, category: str = None) -> bool:
         return True
     
     # Secondary filter: additional semantic similarity checks for edge cases
-    f = feature.lstrip('#').lower()
-    
     # Check for common beauty/fashion related terms that might not be caught by categorization
     beauty_related_patterns = [
         # General beauty terms
@@ -239,15 +254,18 @@ def is_trend_relevant(feature: str, category: str = None) -> bool:
         if pattern in f:
             return True
     
-    # Tertiary filter: check for brand names or product mentions (simplified)
-    # This could be expanded with a comprehensive brand list
-    potential_brand_indicators = [
-        "serum", "cream", "oil", "mask", "treatment", "product", "brand", "line",
-        "collection", "launch", "new", "limited", "edition", "collaboration"
+    # Tertiary filter: check for brand names or product mentions (more specific)
+    # Only consider as relevant if it's clearly beauty/fashion product related
+    potential_beauty_product_indicators = [
+        "serum", "cream", "moisturizer", "cleanser", "mask", "treatment", "oil", 
+        "product review", "brand review", "beauty product", "skincare product",
+        "makeup product", "hair product", "collection launch", "beauty brand",
+        "skincare brand", "makeup brand", "hair brand", "beauty line",
+        "collab", "collaboration", "partnership"
     ]
     
-    for indicator in potential_brand_indicators:
-        if indicator in f and len(f) > 4:  # Avoid very short generic terms
+    for indicator in potential_beauty_product_indicators:
+        if indicator in f and len(f) > 5:  # More stringent length requirement
             return True
     
     return False
