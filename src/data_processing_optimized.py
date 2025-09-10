@@ -419,6 +419,207 @@ class TrendCandidateTable:
             df.to_parquet(filepath, index=False)
             logger.info(f"Saved trend candidate table with {len(df)} entries to {filepath}")
 
+class DatasetPreprocessor:
+    """Dataset-specific preprocessing for comments and videos."""
+    
+    def __init__(self):
+        self.text_cleaner = TextCleaner(handle_emojis='remove')
+        
+    def detect_dataset_type(self, df: pd.DataFrame) -> Optional[str]:
+        """
+        Detect whether dataframe contains comments or videos data.
+        
+        Args:
+            df: Input dataframe
+            
+        Returns:
+            'comments', 'videos', or None if unable to determine
+        """
+        if df.empty:
+            return None
+            
+        columns = set(df.columns)
+        
+        # Check for comments schema
+        comment_indicators = {'textOriginal', 'commentId', 'parentCommentId'}
+        if comment_indicators.issubset(columns):
+            return 'comments'
+            
+        # Check for videos schema  
+        video_indicators = {'title', 'description', 'videoId'}
+        if video_indicators.issubset(columns):
+            return 'videos'
+            
+        # Fallback check - if we have textOriginal, likely comments
+        if 'textOriginal' in columns:
+            return 'comments'
+        elif 'title' in columns:
+            return 'videos'
+            
+        return None
+    
+    def preprocess_comments_dataset(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """
+        Preprocess YouTube comments dataset based on schema.
+        
+        Expected columns: commentId, parentCommentId, channelId, videoId, authorId,
+                         textOriginal, likeCount, publishedAt, updatedAt
+        """
+        if df.empty:
+            return None
+        
+        logger.info(f"Preprocessing comments dataset: {len(df):,} rows")
+        
+        # Check for required columns
+        required_cols = ['textOriginal', 'publishedAt']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            logger.warning(f"Missing required columns for comments: {missing_cols}")
+            return None
+        
+        # Create standardized columns for text processing
+        processed_df = df.copy()
+        
+        # Standardize timestamp column
+        processed_df['timestamp'] = pd.to_datetime(processed_df['publishedAt'], errors='coerce')
+        
+        # Standardize text column - use textOriginal for comments
+        processed_df['text'] = processed_df['textOriginal'].astype(str)
+        
+        # Add engagement metrics if available
+        if 'likeCount' in processed_df.columns:
+            processed_df['engagement_score'] = pd.to_numeric(processed_df['likeCount'], errors='coerce').fillna(0)
+        else:
+            processed_df['engagement_score'] = 0
+        
+        # Add reply indicator for threading analysis
+        if 'parentCommentId' in processed_df.columns:
+            processed_df['is_reply'] = processed_df['parentCommentId'].notna()
+        else:
+            processed_df['is_reply'] = False
+        
+        # Add video context if available
+        if 'videoId' in processed_df.columns:
+            processed_df['video_id'] = processed_df['videoId']
+        
+        # Add author context if available
+        if 'authorId' in processed_df.columns:
+            processed_df['author_id'] = processed_df['authorId']
+            
+        # Filter out invalid entries
+        processed_df = processed_df.dropna(subset=['timestamp', 'text'])
+        processed_df = processed_df[processed_df['text'].str.len() > 0]
+        
+        # Add dataset type identifier
+        processed_df['dataset_type'] = 'comments'
+        
+        logger.info(f"Comments preprocessing complete: {len(processed_df):,} valid rows")
+        return processed_df
+    
+    def preprocess_videos_dataset(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """
+        Preprocess YouTube videos dataset based on schema.
+        
+        Expected columns: channelId, videoId, title, description, tags, defaultLanguage,
+                         defaultAudioLanguage, contentDuration, viewCount, likeCount,
+                         favouriteCount, commentCount, topicCategories, publishedAt
+        """
+        if df.empty:
+            return None
+        
+        logger.info(f"Preprocessing videos dataset: {len(df):,} rows")
+        
+        # Check for required columns
+        required_cols = ['title', 'publishedAt']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            logger.warning(f"Missing required columns for videos: {missing_cols}")
+            return None
+        
+        # Create standardized columns for text processing
+        processed_df = df.copy()
+        
+        # Standardize timestamp column
+        processed_df['timestamp'] = pd.to_datetime(processed_df['publishedAt'], errors='coerce')
+        
+        # Combine title, description, and tags for comprehensive text analysis
+        text_parts = []
+        if 'title' in processed_df.columns:
+            text_parts.append(processed_df['title'].fillna('').astype(str))
+        if 'description' in processed_df.columns:
+            text_parts.append(processed_df['description'].fillna('').astype(str))
+        if 'tags' in processed_df.columns:
+            # Handle tags - they might be stored as strings or lists
+            tags_text = processed_df['tags'].fillna('').astype(str)
+            text_parts.append(tags_text)
+        
+        if text_parts:
+            processed_df['text'] = text_parts[0]
+            for part in text_parts[1:]:
+                processed_df['text'] = processed_df['text'] + ' ' + part
+        else:
+            processed_df['text'] = ''
+        
+        # Calculate comprehensive engagement score for videos
+        engagement_components = []
+        if 'viewCount' in processed_df.columns:
+            views = pd.to_numeric(processed_df['viewCount'], errors='coerce').fillna(0)
+            engagement_components.append(views * 0.1)  # Weight views lower
+        if 'likeCount' in processed_df.columns:
+            likes = pd.to_numeric(processed_df['likeCount'], errors='coerce').fillna(0)
+            engagement_components.append(likes * 2.0)  # Weight likes higher
+        if 'commentCount' in processed_df.columns:
+            comments = pd.to_numeric(processed_df['commentCount'], errors='coerce').fillna(0)
+            engagement_components.append(comments * 1.5)  # Weight comments high
+        if 'favouriteCount' in processed_df.columns:
+            favorites = pd.to_numeric(processed_df['favouriteCount'], errors='coerce').fillna(0)
+            engagement_components.append(favorites * 3.0)  # Weight favorites highest
+        
+        if engagement_components:
+            processed_df['engagement_score'] = sum(engagement_components)
+        else:
+            processed_df['engagement_score'] = 0
+        
+        # Add video-specific metadata
+        if 'contentDuration' in processed_df.columns:
+            processed_df['content_duration'] = processed_df['contentDuration']
+        if 'videoId' in processed_df.columns:
+            processed_df['video_id'] = processed_df['videoId']
+        if 'channelId' in processed_df.columns:
+            processed_df['channel_id'] = processed_df['channelId']
+        if 'topicCategories' in processed_df.columns:
+            processed_df['topic_categories'] = processed_df['topicCategories']
+            
+        # Filter out invalid entries
+        processed_df = processed_df.dropna(subset=['timestamp', 'text'])
+        processed_df = processed_df[processed_df['text'].str.len() > 0]
+        
+        # Add dataset type identifier
+        processed_df['dataset_type'] = 'videos'
+        
+        logger.info(f"Videos preprocessing complete: {len(processed_df):,} valid rows")
+        return processed_df
+    
+    def preprocess_dataset(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """
+        Automatically detect dataset type and apply appropriate preprocessing.
+        
+        Args:
+            df: Input dataframe
+            
+        Returns:
+            Preprocessed dataframe with standardized columns
+        """
+        dataset_type = self.detect_dataset_type(df)
+        
+        if dataset_type == 'comments':
+            return self.preprocess_comments_dataset(df)
+        elif dataset_type == 'videos':
+            return self.preprocess_videos_dataset(df)
+        else:
+            logger.warning(f"Unable to determine dataset type for dataframe with columns: {list(df.columns)}")
+            return None
+
 class DataProcessor:
     """Main data processing pipeline."""
     
@@ -428,37 +629,48 @@ class DataProcessor:
         self.audio_processor = AudioProcessor()
         self.time_engineer = TimeSeriesEngineer()
         self.trend_table = TrendCandidateTable()
+        self.preprocessor = DatasetPreprocessor()
     
-    def process_text_data(self, df: pd.DataFrame, text_col: str, 
-                         timestamp_col: str) -> pd.DataFrame:
+    def process_text_data(self, df: pd.DataFrame, text_col: str = None, 
+                         timestamp_col: str = None) -> pd.DataFrame:
         """
-        Process text data (comments, captions, etc.) through the full pipeline.
+        Process text data (comments, videos, etc.) through the full pipeline.
         
         Args:
-            df: Input dataframe
-            text_col: Column containing text data
-            timestamp_col: Column containing timestamps
+            df: Input dataframe (raw from parquet file)
+            text_col: Column containing text data (deprecated - auto-detected)
+            timestamp_col: Column containing timestamps (deprecated - auto-detected)
             
         Returns:
             Processed dataframe with cleaned text and categories
         """
         logger.info(f"Processing {len(df)} text records")
         
-        # Clean text
-        df['cleaned_text'] = df[text_col].apply(self.text_cleaner.clean_text)
+        # First, apply dataset-specific preprocessing to standardize the data
+        df_preprocessed = self.preprocessor.preprocess_dataset(df)
         
-        # Extract hashtags
-        df['hashtags'] = df[text_col].apply(self.text_cleaner.extract_hashtags)
+        if df_preprocessed is None:
+            logger.warning("Dataset preprocessing failed - returning empty DataFrame")
+            return pd.DataFrame()
+        
+        # Now continue with standard text processing on the standardized 'text' column
+        df_processed = df_preprocessed.copy()
+        
+        # Clean text
+        df_processed['cleaned_text'] = df_processed['text'].apply(self.text_cleaner.clean_text)
+        
+        # Extract hashtags from original text (before cleaning)
+        df_processed['hashtags'] = df_processed['text'].apply(self.text_cleaner.extract_hashtags)
         
         # Tokenize and filter
-        df['tokens'] = df['cleaned_text'].apply(self.text_cleaner.tokenize_and_filter)
+        df_processed['tokens'] = df_processed['cleaned_text'].apply(self.text_cleaner.tokenize_and_filter)
         
         # Classify categories
-        df['category'] = df['cleaned_text'].apply(self.category_classifier.classify_text)
+        df_processed['category'] = df_processed['cleaned_text'].apply(self.category_classifier.classify_text)
         
         # Filter out irrelevant data
-        relevant_mask = df['category'].notna()
-        df_filtered = df[relevant_mask].copy()
+        relevant_mask = df_processed['category'].notna()
+        df_filtered = df_processed[relevant_mask].copy()
         
         logger.info(f"Filtered to {len(df_filtered)} relevant records ({len(df_filtered)/len(df)*100:.1f}%)")
         
@@ -552,7 +764,7 @@ class DataProcessor:
         Run the complete data processing pipeline.
         
         Args:
-            data_sources: Dictionary of data sources (text data, audio data, etc.)
+            data_sources: Dictionary of data sources (parquet DataFrames with raw schema)
             
         Returns:
             Dictionary containing all processed results
@@ -566,30 +778,35 @@ class DataProcessor:
             'trend_candidates': None
         }
         
-        # Process text data sources
+        # Process text data sources - now each DataFrame can be comments or videos
         for source_name, df in data_sources.items():
-            if 'text' in df.columns and 'timestamp' in df.columns:
-                logger.info(f"Processing text data from {source_name}")
+            if not df.empty:
+                logger.info(f"Processing data from {source_name}")
                 
-                processed_text = self.process_text_data(df, 'text', 'timestamp')
-                results['processed_text'][source_name] = processed_text
+                # Use the new preprocessing approach that auto-detects dataset type
+                processed_text = self.process_text_data(df)
                 
-                # Create time series for hashtags
-                if 'hashtags' in processed_text.columns:
-                    hashtag_df = processed_text.explode('hashtags').dropna(subset=['hashtags'])
-                    if not hashtag_df.empty:
-                        hashtag_ts = self.create_time_series_features(
-                            hashtag_df, 'hashtags', 'timestamp', ['1h', '6h']
+                if not processed_text.empty:
+                    results['processed_text'][source_name] = processed_text
+                    
+                    # Create time series for hashtags
+                    if 'hashtags' in processed_text.columns:
+                        hashtag_df = processed_text.explode('hashtags').dropna(subset=['hashtags'])
+                        if not hashtag_df.empty:
+                            hashtag_ts = self.create_time_series_features(
+                                hashtag_df, 'hashtags', 'timestamp', ['1h', '6h']
+                            )
+                            results['time_series'][f'{source_name}_hashtags'] = hashtag_ts
+                    
+                    # Create time series for keywords/tokens
+                    token_df = processed_text.explode('tokens').dropna(subset=['tokens'])
+                    if not token_df.empty:
+                        keyword_ts = self.create_time_series_features(
+                            token_df, 'tokens', 'timestamp', ['1h', '6h']
                         )
-                        results['time_series'][f'{source_name}_hashtags'] = hashtag_ts
-                
-                # Create time series for keywords/tokens
-                token_df = processed_text.explode('tokens').dropna(subset=['tokens'])
-                if not token_df.empty:
-                    keyword_ts = self.create_time_series_features(
-                        token_df, 'tokens', 'timestamp', ['1h', '6h']
-                    )
-                    results['time_series'][f'{source_name}_keywords'] = keyword_ts
+                        results['time_series'][f'{source_name}_keywords'] = keyword_ts
+                else:
+                    logger.warning(f"No relevant data found in {source_name}")
         
         # Process audio data if available
         if 'audio_files' in data_sources:
@@ -635,29 +852,56 @@ class DataProcessor:
 def main():
     """Main function to run the data processing pipeline."""
     
-    # Example usage with sample data
+    # Example usage with sample data that matches the actual schemas
     logger.info("L'Oréal Datathon 2025 - Data Processing Pipeline")
     
-    # Create sample data for demonstration
+    # Create sample data that matches the actual YouTube dataset schemas
     sample_data = {
         'comments': pd.DataFrame({
-            'text': [
+            'commentId': ['c1', 'c2', 'c3', 'c4', 'c5'],
+            'parentCommentId': [None, 'c1', None, None, None],
+            'channelId': ['ch1', 'ch2', 'ch1', 'ch3', 'ch2'],
+            'videoId': ['v1', 'v1', 'v2', 'v3', 'v2'],
+            'authorId': ['a1', 'a2', 'a3', 'a4', 'a5'],
+            'textOriginal': [
                 'Love this #skincare routine! #glowup #beauty',
                 'Best #makeup tutorial ever! #contour #highlight',
                 'This #niacinamide serum is amazing! #skincare',
-                'Politics and news today', # This should be filtered out
+                'Politics and news today',  # This should be filtered out
                 '#OOTD looking fresh! #fashion #style'
             ],
-            'timestamp': pd.date_range('2025-01-01', periods=5, freq='6H')
+            'likeCount': [15, 23, 8, 2, 12],
+            'publishedAt': pd.date_range('2025-01-01', periods=5, freq='6H'),
+            'updatedAt': pd.date_range('2025-01-01', periods=5, freq='6H')
         }),
-        'captions': pd.DataFrame({
-            'text': [
-                'Get ready with me! #grwm #makeup #beauty',
-                'Skincare routine for glowing skin #skincare #glassskin',
-                'Random video about cooking', # This should be filtered out
-                'Fashion haul from this weekend #fashion #haul'
+        'videos': pd.DataFrame({
+            'channelId': ['ch1', 'ch2', 'ch3', 'ch4'],
+            'videoId': ['v1', 'v2', 'v3', 'v4'],
+            'title': [
+                'Ultimate Skincare Routine for Glowing Skin',
+                'Get Ready With Me: Makeup Tutorial',
+                'Random cooking video',  # This should be filtered out
+                'Fashion Haul: Spring 2025 Trends'
             ],
-            'timestamp': pd.date_range('2025-01-01', periods=4, freq='12H')
+            'description': [
+                'In this video I share my complete skincare routine with #niacinamide and #retinol',
+                'Full makeup tutorial with #contour and #highlight techniques #beauty',
+                'Cooking pasta with tomatoes',  # This should be filtered out
+                'Showing you the latest #fashion trends for spring #style #ootd'
+            ],
+            'tags': [
+                'skincare,beauty,niacinamide,routine',
+                'makeup,tutorial,beauty,contour',
+                'cooking,food,pasta',
+                'fashion,style,haul,trends'
+            ],
+            'defaultLanguage': ['en', 'en', 'en', 'en'],
+            'contentDuration': ['PT10M30S', 'PT15M45S', 'PT8M20S', 'PT12M10S'],
+            'viewCount': [150000, 89000, 25000, 67000],
+            'likeCount': [8500, 4200, 850, 3200],
+            'commentCount': [320, 180, 45, 150],
+            'favouriteCount': [450, 220, 30, 180],
+            'publishedAt': pd.date_range('2025-01-01', periods=4, freq='12H')
         })
     }
     
@@ -667,16 +911,38 @@ def main():
     # Run pipeline
     results = processor.run_full_pipeline(sample_data)
     
-    # Print summary
+    # Print summary showing different handling of comments vs videos
     print("\n" + "="*60)
     print("DATA PROCESSING SUMMARY")
     print("="*60)
     
     for source_name, df in results['processed_text'].items():
-        print(f"{source_name.upper()}: {len(df)} relevant records")
+        print(f"\n{source_name.upper()}: {len(df)} relevant records")
         if not df.empty:
+            print(f"  Dataset type: {df['dataset_type'].iloc[0]}")
             categories = df['category'].value_counts()
             print(f"  Categories: {dict(categories)}")
+            
+            # Show dataset-specific fields
+            if df['dataset_type'].iloc[0] == 'comments':
+                if 'is_reply' in df.columns:
+                    replies = df['is_reply'].sum()
+                    print(f"  Replies: {replies}/{len(df)}")
+                if 'video_id' in df.columns:
+                    unique_videos = df['video_id'].nunique()
+                    print(f"  Videos commented on: {unique_videos}")
+            elif df['dataset_type'].iloc[0] == 'videos':
+                if 'content_duration' in df.columns:
+                    print(f"  Has duration info: {df['content_duration'].notna().sum()}")
+                if 'channel_id' in df.columns:
+                    unique_channels = df['channel_id'].nunique()
+                    print(f"  Unique channels: {unique_channels}")
+            
+            # Show engagement score range
+            if 'engagement_score' in df.columns:
+                min_eng = df['engagement_score'].min()
+                max_eng = df['engagement_score'].max()
+                print(f"  Engagement score range: {min_eng:.0f} - {max_eng:.0f}")
     
     if results['trend_candidates'] is not None:
         print(f"\nTREND CANDIDATES: {len(results['trend_candidates'])} entries")
@@ -686,6 +952,10 @@ def main():
             for _, row in top_trends.iterrows():
                 print(f"  {row['feature']}: {row['rate_of_change']:.2%} growth")
     
+    print("\n" + "="*60)
+    print("SCHEMA-AWARE PROCESSING DEMONSTRATION:")
+    print("- Comments: Used 'textOriginal' field, added reply indicators")
+    print("- Videos: Combined title+description+tags, richer engagement scores") 
     print("="*60)
 
 if __name__ == "__main__":
