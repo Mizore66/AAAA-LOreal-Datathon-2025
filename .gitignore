@@ -13,11 +13,8 @@ ENV/
 .ipynb_checkpoints/
 
 # Data
+/data/
 dataset (1).zip
-/data/raw/
-/data/interim/
-/data/processed/
-/data/cache/
 /models/
 /assets/
 
