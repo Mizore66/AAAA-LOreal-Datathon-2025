@@ -17,7 +17,7 @@ def parse_phase2_report() -> Dict[str, Any]:
     Returns:
         Dictionary containing all structured report data
     """
-    report_path = "data/interim/phase2_enhanced_features_report.md"
+    report_path = "../data/interim/phase2_enhanced_features_report.md"
     
     if not os.path.exists(report_path):
         print(f"❌ Report file not found: {report_path}")
@@ -224,7 +224,7 @@ def main():
         return
     
     # Save comprehensive JSON
-    output_path = "data/interim/phase2_enhanced_features_comprehensive.json"
+    output_path = "../data/interim/phase2_enhanced_features_comprehensive_parsed.json"
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
     with open(output_path, 'w', encoding='utf-8') as f:

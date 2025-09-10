@@ -1,0 +1,60 @@
+{
+  "translation_timestamp": "2025-09-11 02:56:51",
+  "translation_type": "unified_features_and_reports",
+  "statistics": {
+    "total_terms": 0,
+    "english_terms": 0,
+    "translated_terms": 0,
+    "failed_translations": 0,
+    "beauty_relevant": 0,
+    "detected_languages": {},
+    "files_processed": {
+      "feature_files": 0,
+      "json_reports": 0
+    }
+  },
+  "beauty_keywords": [
+    "style",
+    "mascara",
+    "nail",
+    "powder",
+    "eyeliner",
+    "cosmetics",
+    "shampoo",
+    "beauty",
+    "face",
+    "lipstick",
+    "lotion",
+    "styling",
+    "cleanser",
+    "conditioner",
+    "serum",
+    "color",
+    "moisturizer",
+    "contour",
+    "skincare",
+    "toner",
+    "lips",
+    "polish",
+    "highlight",
+    "hair",
+    "blush",
+    "foundation",
+    "fashion",
+    "skin",
+    "makeup",
+    "cream",
+    "eyes"
+  ],
+  "configuration": {
+    "confidence_threshold": 0.7,
+    "translation_available": true
+  },
+  "summary": {
+    "total_files_processed": 0,
+    "feature_files_processed": 0,
+    "json_reports_processed": 0,
+    "beauty_relevance_rate": 0,
+    "translation_rate": 0
+  }
+}
