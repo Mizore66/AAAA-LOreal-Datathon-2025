@@ -325,91 +325,161 @@ class FeatureTextProcessor:
         return result
     
     def process_feature_file(self, file_path: Union[str, Path], 
-                           text_columns: List[str] = None) -> pd.DataFrame:
+                           text_columns: List[str] = None,
+                           output_dir: str = None) -> Dict:
         """
         Process a feature file containing terms to be corrected and translated.
         
         Args:
             file_path: Path to the feature file
             text_columns: List of column names containing text to process
+            output_dir: Directory to save processed results
             
         Returns:
-            DataFrame with processed features
+            Dictionary with processing results and statistics
         """
         file_path = Path(file_path)
-        logger.info(f"Processing feature file: {file_path}")
+        logger.info(f"🔤 Processing feature file: {file_path}")
         
-        try:
-            # Load file based on extension
-            if file_path.suffix.lower() == '.parquet':
-                df = pd.read_parquet(file_path)
-            elif file_path.suffix.lower() == '.csv':
-                df = pd.read_csv(file_path)
-            elif file_path.suffix.lower() == '.json':
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                if isinstance(data, list):
-                    df = pd.DataFrame(data)
+        results = {
+            'input_path': str(file_path),
+            'output_path': None,
+            'correction_stats': {},
+            'translation_stats': {},
+            'processing_time': None
+        }
+        
+        start_time = time.time()
+        
+        # Step 1: Load file with progress tracking
+        with tqdm(total=6, desc=f"Processing {file_path.name}", unit="step") as main_pbar:
+            try:
+                main_pbar.set_postfix(step="loading file")
+                # Load file based on extension
+                if file_path.suffix.lower() == '.parquet':
+                    df = pd.read_parquet(file_path)
+                elif file_path.suffix.lower() == '.csv':
+                    df = pd.read_csv(file_path)
+                elif file_path.suffix.lower() == '.json':
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    if isinstance(data, list):
+                        df = pd.DataFrame(data)
+                    else:
+                        df = pd.json_normalize(data)
                 else:
-                    df = pd.json_normalize(data)
-            else:
-                logger.error(f"Unsupported file format: {file_path.suffix}")
-                return pd.DataFrame()
-            
-            if df.empty:
-                logger.warning(f"Empty file: {file_path}")
-                return df
-            
-            # Auto-detect text columns if not provided
-            if text_columns is None:
-                text_columns = []
-                for col in df.columns:
-                    if df[col].dtype == 'object':
-                        # Check if column contains mostly string data
-                        if df[col].dropna().apply(lambda x: isinstance(x, str)).mean() > 0.8:
-                            text_columns.append(col)
-            
-            logger.info(f"Processing text columns: {text_columns}")
-            
-            # Process each text column
-            for col in text_columns:
-                if col not in df.columns:
-                    logger.warning(f"Column '{col}' not found in file")
-                    continue
+                    logger.error(f"Unsupported file format: {file_path.suffix}")
+                    return results
+                main_pbar.update(1)
                 
-                logger.info(f"Processing column: {col}")
+                if df.empty:
+                    logger.warning(f"Empty file: {file_path}")
+                    return results
                 
-                # Process each term in the column
-                processed_results = []
-                terms = df[col].dropna().unique()
+                # Step 2: Auto-detect text columns if not provided
+                main_pbar.set_postfix(step="detecting columns")
+                if text_columns is None:
+                    text_columns = []
+                    for col in df.columns:
+                        if df[col].dtype == 'object':
+                            # Check if column contains mostly string data
+                            if df[col].dropna().apply(lambda x: isinstance(x, str)).mean() > 0.8:
+                                text_columns.append(col)
+                main_pbar.update(1)
                 
-                for term in tqdm(terms, desc=f"Processing {col}"):
-                    result = self.process_term(term)
-                    processed_results.append(result)
+                logger.info(f"Processing text columns: {text_columns}")
                 
-                # Create mapping of original to processed terms
-                term_mapping = {r['original_term']: r['processed_term'] for r in processed_results}
+                # Step 3: Initialize tracking
+                main_pbar.set_postfix(step="initializing")
+                total_corrections = 0
+                total_translations = 0
+                main_pbar.update(1)
                 
-                # Apply mapping to create new columns
-                df[f"{col}_original"] = df[col]
-                df[f"{col}_processed"] = df[col].map(term_mapping).fillna(df[col])
-                df[f"{col}_was_corrected"] = df[col].apply(
-                    lambda x: term_mapping.get(x, x) != x if pd.notna(x) else False
-                )
+                # Step 4: Process each text column
+                main_pbar.set_postfix(step="processing columns")
+                with tqdm(text_columns, desc="Processing columns", leave=False) as col_pbar:
+                    for col in col_pbar:
+                        if col not in df.columns:
+                            logger.warning(f"Column '{col}' not found in file")
+                            continue
+                        
+                        col_pbar.set_postfix(column=col)
+                        logger.info(f"🔤 Processing column: {col}")
+                        
+                        # Process each term in the column
+                        processed_results = []
+                        terms = df[col].dropna().unique()
+                        
+                        # Term-level progress tracking
+                        corrections_this_col = 0
+                        translations_this_col = 0
+                        
+                        with tqdm(terms, desc=f"Processing {col}", leave=False, unit="term") as term_pbar:
+                            for term in term_pbar:
+                                result = self.process_term(term)
+                                processed_results.append(result)
+                                
+                                # Count corrections and translations
+                                if result.get('was_corrected', False):
+                                    corrections_this_col += 1
+                                if result.get('was_translated', False):
+                                    translations_this_col += 1
+                                
+                                # Update progress bar with stats
+                                term_pbar.set_postfix({
+                                    'corrections': corrections_this_col,
+                                    'translations': translations_this_col
+                                })
+                        
+                        total_corrections += corrections_this_col
+                        total_translations += translations_this_col
+                        
+                        # Create mapping of original to processed terms
+                        term_mapping = {r['original_term']: r['processed_term'] for r in processed_results}
+                        
+                        # Apply mapping to create new columns
+                        df[f"{col}_original"] = df[col]
+                        df[f"{col}_processed"] = df[col].map(term_mapping).fillna(df[col])
+                        df[f"{col}_was_corrected"] = df[col].apply(
+                            lambda x: term_mapping.get(x, x) != x if pd.notna(x) else False
+                        )
+                        
+                        # Save detailed processing info for unique terms
+                        if output_dir:
+                            detailed_df = pd.DataFrame(processed_results)
+                            detail_path = Path(output_dir) / f"{file_path.stem}_{col}_processing_details.parquet"
+                            detail_path.parent.mkdir(parents=True, exist_ok=True)
+                            detailed_df.to_parquet(detail_path, index=False)
+                        
+                        # Update column stats
+                        results['correction_stats'][col] = corrections_this_col
+                        results['translation_stats'][col] = translations_this_col
                 
-                # Add detailed processing info for unique terms
-                detailed_df = pd.DataFrame(processed_results)
-                detailed_df.to_parquet(
-                    PROCESSED_FEATURES_DIR / f"{file_path.stem}_{col}_processing_details.parquet",
-                    index=False
-                )
-            
-            logger.info(f"Completed processing file: {file_path}")
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error processing file {file_path}: {e}")
-            return pd.DataFrame()
+                main_pbar.update(1)
+                
+                # Step 5: Save processed file
+                main_pbar.set_postfix(step="saving results")
+                if output_dir:
+                    output_path = Path(output_dir) / f"{file_path.stem}_processed.parquet"
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    df.to_parquet(output_path, index=False)
+                    results['output_path'] = str(output_path)
+                    logger.info(f"✅ Processed file saved to: {output_path}")
+                main_pbar.update(1)
+                
+                # Step 6: Finalize
+                main_pbar.set_postfix(step="finalizing")
+                processing_time = time.time() - start_time
+                results['processing_time'] = processing_time
+                
+                logger.info(f"✅ Completed processing {file_path.name}: {total_corrections} corrections, {total_translations} translations in {processing_time:.2f}s")
+                main_pbar.update(1)
+                
+                return results
+                
+            except Exception as e:
+                logger.error(f"❌ Error processing file {file_path}: {e}")
+                return results
     
     def process_directory(self, directory_path: Union[str, Path], 
                          file_patterns: List[str] = None) -> Dict[str, pd.DataFrame]:

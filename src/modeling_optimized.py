@@ -427,42 +427,67 @@ class CategoryClassifier:
         
         results = []
         
-        logger.info(f"Classifying {len(texts)} posts into categories")
+        logger.info(f"🏷️  Classifying {len(texts)} posts into categories")
         
-        for text in tqdm(texts, desc="Classifying posts"):
-            if not isinstance(text, str) or not text.strip():
-                results.append({
-                    'predicted_category': 'lifestyle',
-                    'confidence': 0.0,
-                    'scores': {cat: 0.0 for cat in self.categories}
-                })
-                continue
-            
-            try:
-                result = self.classifier(text, self.categories)
-                
-                predicted_category = result['labels'][0]
-                confidence = result['scores'][0]
-                
-                # Create scores dictionary
-                scores = {}
-                for label, score in zip(result['labels'], result['scores']):
-                    scores[label] = score
-                
-                results.append({
-                    'predicted_category': predicted_category,
-                    'confidence': confidence,
-                    'scores': scores
-                })
-                
-            except Exception as e:
-                logger.warning(f"Classification failed for text: {e}")
-                results.append({
-                    'predicted_category': 'lifestyle',
-                    'confidence': 0.0,
-                    'scores': {cat: 0.0 for cat in self.categories}
-                })
+        # Batch processing for better performance
+        batch_size = min(100, len(texts))  # Process in batches of 100 or less
+        num_batches = (len(texts) // batch_size) + (1 if len(texts) % batch_size else 0)
         
+        successful_classifications = 0
+        failed_classifications = 0
+        
+        with tqdm(total=len(texts), desc="Classifying posts", unit="post") as pbar:
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, len(texts))
+                batch_texts = texts[start_idx:end_idx]
+                
+                # Process each text in the batch
+                for text in batch_texts:
+                    if not isinstance(text, str) or not text.strip():
+                        results.append({
+                            'predicted_category': 'lifestyle',
+                            'confidence': 0.0,
+                            'scores': {cat: 0.0 for cat in self.categories}
+                        })
+                        failed_classifications += 1
+                    else:
+                        try:
+                            result = self.classifier(text, self.categories)
+                            
+                            predicted_category = result['labels'][0]
+                            confidence = result['scores'][0]
+                            
+                            # Create scores dictionary
+                            scores = {}
+                            for label, score in zip(result['labels'], result['scores']):
+                                scores[label] = score
+                            
+                            results.append({
+                                'predicted_category': predicted_category,
+                                'confidence': confidence,
+                                'scores': scores
+                            })
+                            successful_classifications += 1
+                            
+                        except Exception as e:
+                            logger.warning(f"Classification failed for text: {e}")
+                            results.append({
+                                'predicted_category': 'lifestyle',
+                                'confidence': 0.0,
+                                'scores': {cat: 0.0 for cat in self.categories}
+                            })
+                            failed_classifications += 1
+                    
+                    # Update progress
+                    pbar.update(1)
+                    pbar.set_postfix({
+                        'successful': successful_classifications,
+                        'failed': failed_classifications,
+                        'success_rate': f"{successful_classifications/(successful_classifications+failed_classifications)*100:.1f}%" if (successful_classifications+failed_classifications) > 0 else "0%"
+                    })
+        
+        logger.info(f"✅ Classification complete: {successful_classifications} successful, {failed_classifications} failed")
         return results
     
     def _rule_based_classification(self, texts: List[str]) -> List[Dict[str, any]]:
@@ -553,54 +578,84 @@ class SentimentAnalyzer:
         
         results = []
         
-        logger.info(f"Analyzing sentiment for {len(texts)} texts")
+        logger.info(f"😊 Analyzing sentiment for {len(texts)} texts")
         
-        for text in tqdm(texts, desc="Analyzing sentiment"):
-            if not isinstance(text, str) or not text.strip():
-                results.append({
-                    'sentiment': 'neutral',
-                    'confidence': 0.0,
-                    'score': 0.0
-                })
-                continue
-            
-            try:
-                # Truncate text if too long
-                text_truncated = text[:500]
-                
-                result = self.sentiment_pipeline(text_truncated)
-                
-                if isinstance(result, list):
-                    result = result[0]
-                
-                sentiment = result['label'].lower()
-                confidence = result['score']
-                
-                # Convert to standardized sentiment labels
-                if sentiment in ['positive', 'pos']:
-                    sentiment = 'positive'
-                    score = confidence
-                elif sentiment in ['negative', 'neg']:
-                    sentiment = 'negative'
-                    score = -confidence
-                else:
-                    sentiment = 'neutral'
-                    score = 0.0
-                
-                results.append({
-                    'sentiment': sentiment,
-                    'confidence': confidence,
-                    'score': score
-                })
-                
-            except Exception as e:
-                logger.warning(f"Sentiment analysis failed: {e}")
-                results.append({
-                    'sentiment': 'neutral',
-                    'confidence': 0.0,
-                    'score': 0.0
-                })
+        # Batch processing for better performance
+        batch_size = min(50, len(texts))  # Smaller batches for sentiment analysis
+        num_batches = (len(texts) // batch_size) + (1 if len(texts) % batch_size else 0)
         
+        sentiment_stats = {'positive': 0, 'negative': 0, 'neutral': 0}
+        failed_analyses = 0
+        
+        with tqdm(total=len(texts), desc="Analyzing sentiment", unit="text") as pbar:
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, len(texts))
+                batch_texts = texts[start_idx:end_idx]
+                
+                # Process each text in the batch
+                for text in batch_texts:
+                    if not isinstance(text, str) or not text.strip():
+                        results.append({
+                            'sentiment': 'neutral',
+                            'confidence': 0.0,
+                            'score': 0.0
+                        })
+                        sentiment_stats['neutral'] += 1
+                    else:
+                        try:
+                            # Truncate text if too long
+                            text_truncated = text[:500]
+                            
+                            result = self.sentiment_pipeline(text_truncated)
+                            
+                            if isinstance(result, list):
+                                result = result[0]
+                            
+                            sentiment = result['label'].lower()
+                            confidence = result['score']
+                            
+                            # Convert to standardized sentiment labels
+                            if sentiment in ['positive', 'pos']:
+                                sentiment = 'positive'
+                                score = confidence
+                            elif sentiment in ['negative', 'neg']:
+                                sentiment = 'negative'
+                                score = -confidence
+                            else:
+                                sentiment = 'neutral'
+                                score = 0.0
+                            
+                            results.append({
+                                'sentiment': sentiment,
+                                'confidence': confidence,
+                                'score': score
+                            })
+                            
+                            sentiment_stats[sentiment] += 1
+                            
+                        except Exception as e:
+                            logger.warning(f"Sentiment analysis failed: {e}")
+                            results.append({
+                                'sentiment': 'neutral',
+                                'confidence': 0.0,
+                                'score': 0.0
+                            })
+                            failed_analyses += 1
+                    
+                    # Update progress
+                    pbar.update(1)
+                    total_processed = sum(sentiment_stats.values()) + failed_analyses
+                    if total_processed > 0:
+                        pbar.set_postfix({
+                            'pos': f"{sentiment_stats['positive']}/{total_processed}",
+                            'neg': f"{sentiment_stats['negative']}/{total_processed}",
+                            'neu': f"{sentiment_stats['neutral']}/{total_processed}",
+                            'failed': failed_analyses
+                        })
+        
+        total_analyzed = sum(sentiment_stats.values())
+        logger.info(f"✅ Sentiment analysis complete: {sentiment_stats['positive']} positive, {sentiment_stats['negative']} negative, {sentiment_stats['neutral']} neutral, {failed_analyses} failed")
         return results
     
     def _rule_based_sentiment(self, texts: List[str]) -> List[Dict[str, any]]:

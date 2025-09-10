@@ -21,6 +21,9 @@ from multiprocessing import Pool, cpu_count
 from functools import partial
 import gc
 
+# Required for pyarrow file information
+import pyarrow.parquet as pq
+
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
@@ -728,34 +731,54 @@ class OptimizedDataProcessor:
         if chunk.empty:
             return pd.DataFrame()
         
-        # Apply dataset-specific preprocessing to standardize the data
-        chunk_preprocessed = self.preprocessor.preprocess_dataset(chunk)
+        # Processing steps with progress tracking
+        processing_steps = [
+            ("Dataset preprocessing", lambda: self.preprocessor.preprocess_dataset(chunk)),
+            ("Relevance filtering", None),  # Special handling
+            ("Text cleaning", None),  # Special handling  
+            ("Category classification", None),  # Special handling
+            ("Final filtering", None)  # Special handling
+        ]
         
-        if chunk_preprocessed is None or chunk_preprocessed.empty:
-            return pd.DataFrame()
-        
-        # Early filtering for relevance using fast string operations
-        relevant_mask = self.text_cleaner.fast_relevance_filter(chunk_preprocessed['text'])
-        
-        if not relevant_mask.any():
-            logger.debug(f"No relevant content found in chunk of {len(chunk)} rows")
-            return pd.DataFrame()
-        
-        # Filter to relevant rows only
-        chunk_relevant = chunk_preprocessed[relevant_mask].copy()
-        logger.debug(f"Filtered chunk from {len(chunk)} to {len(chunk_relevant)} relevant rows")
-        
-        # Vectorized text processing
-        chunk_relevant['cleaned_text'] = self.text_cleaner.clean_text_vectorized(chunk_relevant['text'])
-        chunk_relevant['hashtags'] = self.text_cleaner.extract_hashtags_vectorized(chunk_relevant['text'])
-        chunk_relevant['tokens'] = self.text_cleaner.tokenize_and_filter_vectorized(chunk_relevant['cleaned_text'])
-        
-        # Vectorized category classification
-        chunk_relevant['category'] = self.category_classifier.classify_text_vectorized(chunk_relevant['cleaned_text'])
-        
-        # Final filter - only keep rows with assigned categories
-        final_mask = chunk_relevant['category'].notna()
-        chunk_final = chunk_relevant[final_mask].copy()
+        with tqdm(total=len(processing_steps), desc=f"Processing chunk ({len(chunk):,} rows)", leave=False) as pbar:
+            # Step 1: Apply dataset-specific preprocessing to standardize the data
+            pbar.set_postfix(step="preprocessing")
+            chunk_preprocessed = self.preprocessor.preprocess_dataset(chunk)
+            pbar.update(1)
+            
+            if chunk_preprocessed is None or chunk_preprocessed.empty:
+                return pd.DataFrame()
+            
+            # Step 2: Early filtering for relevance using fast string operations
+            pbar.set_postfix(step="relevance filtering")
+            relevant_mask = self.text_cleaner.fast_relevance_filter(chunk_preprocessed['text'])
+            pbar.update(1)
+            
+            if not relevant_mask.any():
+                logger.debug(f"No relevant content found in chunk of {len(chunk)} rows")
+                return pd.DataFrame()
+            
+            # Filter to relevant rows only
+            chunk_relevant = chunk_preprocessed[relevant_mask].copy()
+            logger.debug(f"Filtered chunk from {len(chunk)} to {len(chunk_relevant)} relevant rows")
+            
+            # Step 3: Vectorized text processing
+            pbar.set_postfix(step="text cleaning")
+            chunk_relevant['cleaned_text'] = self.text_cleaner.clean_text_vectorized(chunk_relevant['text'])
+            chunk_relevant['hashtags'] = self.text_cleaner.extract_hashtags_vectorized(chunk_relevant['text'])
+            chunk_relevant['tokens'] = self.text_cleaner.tokenize_and_filter_vectorized(chunk_relevant['cleaned_text'])
+            pbar.update(1)
+            
+            # Step 4: Vectorized category classification
+            pbar.set_postfix(step="categorization")
+            chunk_relevant['category'] = self.category_classifier.classify_text_vectorized(chunk_relevant['cleaned_text'])
+            pbar.update(1)
+            
+            # Step 5: Final filter - only keep rows with assigned categories
+            pbar.set_postfix(step="final filtering")
+            final_mask = chunk_relevant['category'].notna()
+            chunk_final = chunk_relevant[final_mask].copy()
+            pbar.update(1)
         
         # Memory cleanup
         del chunk_preprocessed, chunk_relevant
@@ -780,10 +803,27 @@ class OptimizedDataProcessor:
             total_input_rows = 0
             total_output_rows = 0
             
-            # Process file in chunks
-            for i, chunk in enumerate(self.chunked_reader(filepath)):
+            # First, estimate total chunks for progress bar
+            try:
+                # Quick count of total rows
+                import pyarrow.parquet as pq
+                parquet_file = pq.ParquetFile(filepath)
+                estimated_total_rows = parquet_file.metadata.num_rows
+                estimated_chunks = (estimated_total_rows // CHUNK_SIZE) + 1
+                logger.info(f"Estimated {estimated_total_rows:,} rows in {estimated_chunks} chunks")
+            except:
+                estimated_chunks = None
+                logger.info("Could not estimate total chunks, will show incremental progress")
+            
+            # Process file in chunks with progress bar
+            chunk_iterator = self.chunked_reader(filepath)
+            if estimated_chunks:
+                chunk_iterator = tqdm(chunk_iterator, total=estimated_chunks, desc="Processing chunks", unit="chunk")
+            else:
+                chunk_iterator = tqdm(chunk_iterator, desc="Processing chunks", unit="chunk")
+            
+            for i, chunk in enumerate(chunk_iterator):
                 total_input_rows += len(chunk)
-                logger.info(f"Processing chunk {i+1}: {len(chunk):,} rows")
                 
                 processed_chunk = self.process_text_chunk(chunk)
                 
@@ -791,14 +831,22 @@ class OptimizedDataProcessor:
                     chunks_processed.append(processed_chunk)
                     total_output_rows += len(processed_chunk)
                 
-                # Log progress every 10 chunks
-                if (i + 1) % 10 == 0:
-                    relevance_rate = (total_output_rows / total_input_rows * 100) if total_input_rows > 0 else 0
-                    logger.info(f"Processed {i+1} chunks: {total_input_rows:,} → {total_output_rows:,} ({relevance_rate:.1f}% relevant)")
+                # Update progress bar description with stats
+                relevance_rate = (total_output_rows / total_input_rows * 100) if total_input_rows > 0 else 0
+                if hasattr(chunk_iterator, 'set_postfix'):
+                    chunk_iterator.set_postfix({
+                        'Input': f"{total_input_rows:,}",
+                        'Output': f"{total_output_rows:,}",
+                        'Relevance': f"{relevance_rate:.1f}%"
+                    })
             
             if chunks_processed:
-                final_df = pd.concat(chunks_processed, ignore_index=True)
-                logger.info(f"Chunked processing complete: {total_input_rows:,} → {len(final_df):,} rows ({len(final_df)/total_input_rows*100:.1f}% relevant)")
+                logger.info("📊 Concatenating processed chunks...")
+                with tqdm(total=1, desc="Finalizing dataset") as pbar:
+                    final_df = pd.concat(chunks_processed, ignore_index=True)
+                    pbar.update(1)
+                
+                logger.info(f"✅ Chunked processing complete: {total_input_rows:,} → {len(final_df):,} rows ({len(final_df)/total_input_rows*100:.1f}% relevant)")
                 return final_df
             else:
                 logger.warning("No relevant data found in file")
@@ -810,21 +858,34 @@ class OptimizedDataProcessor:
             # For smaller datasets, we can still use chunking for consistency
             if len(df) > CHUNK_SIZE:
                 chunks_processed = []
-                for start in range(0, len(df), CHUNK_SIZE):
-                    end = min(start + CHUNK_SIZE, len(df))
-                    chunk = df.iloc[start:end].copy()
-                    
-                    processed_chunk = self.process_text_chunk(chunk)
-                    if not processed_chunk.empty:
-                        chunks_processed.append(processed_chunk)
+                num_chunks = (len(df) // CHUNK_SIZE) + 1
+                
+                with tqdm(total=num_chunks, desc="Processing chunks in memory", unit="chunk") as pbar:
+                    for start in range(0, len(df), CHUNK_SIZE):
+                        end = min(start + CHUNK_SIZE, len(df))
+                        chunk = df.iloc[start:end].copy()
+                        
+                        processed_chunk = self.process_text_chunk(chunk)
+                        if not processed_chunk.empty:
+                            chunks_processed.append(processed_chunk)
+                        
+                        pbar.update(1)
+                        pbar.set_postfix({'Rows': f"{end:,}/{len(df):,}"})
                 
                 if chunks_processed:
-                    return pd.concat(chunks_processed, ignore_index=True)
+                    logger.info("📊 Concatenating processed chunks...")
+                    with tqdm(total=1, desc="Finalizing dataset") as pbar:
+                        result = pd.concat(chunks_processed, ignore_index=True)
+                        pbar.update(1)
+                    return result
                 else:
                     return pd.DataFrame()
             else:
                 # Small enough to process as single chunk
-                return self.process_text_chunk(df)
+                with tqdm(total=1, desc="Processing single chunk") as pbar:
+                    result = self.process_text_chunk(df)
+                    pbar.update(1)
+                return result
         
         else:
             raise ValueError("Either df or filepath must be provided")
