@@ -77,6 +77,70 @@ class FullPipeline:
         
         logger.info("✅ All pipeline components initialized successfully")
     
+    def discover_dataset_files(self, data_dir: str) -> Dict[str, List[str]]:
+        """
+        Discover comment and video parquet files in a directory
+        
+        Args:
+            data_dir: Directory path containing parquet files
+            
+        Returns:
+            Dictionary with 'comments' and 'videos' lists of file paths
+        """
+        data_path = Path(data_dir)
+        if not data_path.exists():
+            logger.error(f"❌ Data directory not found: {data_dir}")
+            return {'comments': [], 'videos': []}
+        
+        logger.info(f"🔍 Discovering parquet files in: {data_dir}")
+        
+        # Find all parquet files
+        parquet_files = list(data_path.glob('*.parquet'))
+        parquet_files.extend(list(data_path.glob('**/*.parquet')))  # Include subdirectories
+        
+        # Remove duplicates and ensure unique files
+        parquet_files = list(set(parquet_files))
+        
+        # Categorize files based on naming patterns
+        comment_files = []
+        video_files = []
+        
+        for file_path in parquet_files:
+            filename_lower = file_path.name.lower()
+            
+            # Check for comment indicators
+            if any(keyword in filename_lower for keyword in ['comment', 'comments', 'reply', 'replies']):
+                comment_files.append(str(file_path))
+            # Check for video indicators  
+            elif any(keyword in filename_lower for keyword in ['video', 'videos', 'content', 'post', 'posts']):
+                video_files.append(str(file_path))
+            else:
+                # Try to determine by examining the file structure
+                try:
+                    sample_df = pd.read_parquet(file_path, nrows=1)
+                    columns = set(sample_df.columns.str.lower())
+                    
+                    # Check for comment-specific columns
+                    if 'textoriginal' in columns or 'parentcommentid' in columns:
+                        comment_files.append(str(file_path))
+                        logger.info(f"📝 Detected as comments file (schema): {file_path.name}")
+                    # Check for video-specific columns
+                    elif any(col in columns for col in ['title', 'description', 'viewcount', 'contentduration']):
+                        video_files.append(str(file_path))
+                        logger.info(f"🎥 Detected as videos file (schema): {file_path.name}")
+                    else:
+                        logger.warning(f"⚠️  Could not categorize file: {file_path.name}")
+                        
+                except Exception as e:
+                    logger.warning(f"⚠️  Could not read file {file_path.name}: {e}")
+        
+        logger.info(f"✅ Discovered {len(comment_files)} comment files and {len(video_files)} video files")
+        
+        return {
+            'comments': sorted(comment_files),
+            'videos': sorted(video_files)
+        }
+    
     def _get_default_config(self) -> Dict:
         """Get default configuration for the pipeline"""
         return {
@@ -226,12 +290,12 @@ class FullPipeline:
         
         return results
     
-    def _run_data_processing(self, data_sources: Dict[str, str]) -> Dict:
+    def _run_data_processing(self, data_sources: Dict[str, Union[str, List[str]]]) -> Dict:
         """
         Run data processing step with progress tracking
         
         Args:
-            data_sources: Dictionary mapping data types to file paths
+            data_sources: Dictionary mapping data types to file paths or lists of file paths
             
         Returns:
             Data processing results
@@ -244,10 +308,26 @@ class FullPipeline:
             'metadata': {}
         }
         
-        # Count available data sources
-        available_sources = {k: v for k, v in data_sources.items() if v and Path(v).exists()}
+        # Handle directory input for multiple files
+        if isinstance(data_sources, dict) and 'data_dir' in data_sources:
+            discovered_files = self.discover_dataset_files(data_sources['data_dir'])
+            data_sources.update(discovered_files)
+            del data_sources['data_dir']
         
-        if not available_sources:
+        # Flatten file paths - convert single files to lists for uniform processing
+        flattened_sources = {}
+        for source_type, file_paths in data_sources.items():
+            if file_paths is None:
+                continue
+            elif isinstance(file_paths, str):
+                if Path(file_paths).exists():
+                    flattened_sources[source_type] = [file_paths]
+            elif isinstance(file_paths, list):
+                valid_paths = [fp for fp in file_paths if Path(fp).exists()]
+                if valid_paths:
+                    flattened_sources[source_type] = valid_paths
+        
+        if not flattened_sources:
             logger.warning("⚠️  No valid data sources found, using sample data")
             # Process with sample data
             with tqdm(total=1, desc="Processing sample data") as pbar:
@@ -255,26 +335,42 @@ class FullPipeline:
                 results['processed_datasets'].extend(sample_results.get('processed_files', []))
                 pbar.update(1)
         else:
-            # Process each data source with progress tracking
-            with tqdm(available_sources.items(), desc="Processing data sources") as pbar:
-                for source_type, file_path in pbar:
-                    pbar.set_postfix(source=source_type)
+            # Count total files to process
+            total_files = sum(len(files) for files in flattened_sources.values())
+            logger.info(f"📂 Found {total_files} files to process across {len(flattened_sources)} data types")
+            
+            # Process each data source type with progress tracking
+            with tqdm(total=total_files, desc="Processing all data files", position=0) as main_pbar:
+                for source_type, file_paths in flattened_sources.items():
+                    main_pbar.set_description(f"Processing {source_type} files")
                     
-                    logger.info(f"📂 Processing {source_type} data: {file_path}")
-                    
-                    if source_type in ['comments', 'videos']:
-                        # Process parquet files
-                        processed_data = self.data_processor.process_text_data_chunked(
-                            filepath=file_path
-                        )
-                        results['processed_datasets'].extend(processed_data.get('processed_files', []))
-                    
-                    elif source_type == 'audio' and self.config['processing']['enable_audio']:
-                        # Process audio files
-                        audio_results = self.data_processor.process_audio_data(file_path)
-                        results['processed_datasets'].extend(audio_results.get('processed_files', []))
-                    
-                    pbar.update(1)
+                    # Process each file in this source type
+                    with tqdm(file_paths, desc=f"Processing {source_type}", position=1, leave=False) as type_pbar:
+                        for file_path in type_pbar:
+                            type_pbar.set_postfix(file=Path(file_path).name)
+                            
+                            logger.info(f"📂 Processing {source_type} data: {Path(file_path).name}")
+                            
+                            try:
+                                if source_type in ['comments', 'videos']:
+                                    # Process parquet files
+                                    processed_data = self.data_processor.process_text_data_chunked(
+                                        filepath=file_path
+                                    )
+                                    results['processed_datasets'].extend(processed_data.get('processed_files', []))
+                                
+                                elif source_type == 'audio' and self.config['processing']['enable_audio']:
+                                    # Process audio files
+                                    audio_results = self.data_processor.process_audio_data(file_path)
+                                    results['processed_datasets'].extend(audio_results.get('processed_files', []))
+                                
+                                logger.info(f"✅ Successfully processed: {Path(file_path).name}")
+                                
+                            except Exception as e:
+                                logger.error(f"❌ Failed to process {Path(file_path).name}: {e}")
+                                continue
+                            
+                            main_pbar.update(1)
         
         # Generate processing statistics with progress bar
         logger.info("📈 Generating data processing statistics...")
@@ -652,15 +748,24 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+    # Single files
     python full_pipeline.py --comments data/comments.parquet --videos data/videos.parquet
+    
+    # Multiple files from directory  
+    python full_pipeline.py --data-dir data/processed/dataset
+    
+    # Configuration file
     python full_pipeline.py --config pipeline_config.json
-    python full_pipeline.py --sample  # Run with sample data
+    
+    # Sample data
+    python full_pipeline.py --sample
         """
     )
     
     parser.add_argument('--comments', type=str, help='Path to comments parquet file')
     parser.add_argument('--videos', type=str, help='Path to videos parquet file')
     parser.add_argument('--audio', type=str, help='Path to audio files directory')
+    parser.add_argument('--data-dir', type=str, help='Path to directory containing multiple comment and video parquet files')
     parser.add_argument('--config', type=str, help='Path to configuration JSON file')
     parser.add_argument('--sample', action='store_true', help='Run with sample data')
     parser.add_argument('--output-dir', type=str, help='Output directory for results')
@@ -693,7 +798,11 @@ def main():
         config = load_config(args.config)
     
     # Update config with command line arguments
-    if args.comments or args.videos or args.audio:
+    if args.data_dir:
+        # Handle directory input for multiple files
+        config['data_sources'] = {'data_dir': args.data_dir}
+    elif args.comments or args.videos or args.audio:
+        # Handle individual file inputs
         config['data_sources'] = {
             'comments': args.comments,
             'videos': args.videos,
