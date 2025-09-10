@@ -51,25 +51,52 @@ try:
     from sklearn.cluster import KMeans
 except ImportError:
     HAS_SKLEARN = False
-    logger.warning("Scikit-learn not available, some features will be disabled")
-
-try:
-    import scipy.stats as stats
-except ImportError:
-    HAS_SCIPY = False
-    logger.warning("SciPy not available, using fallback statistical functions")
+    logger.warning("scikit-learn not available, some features disabled")
 
 try:
     from statsmodels.tsa.seasonal import STL
+    import statsmodels.api as sm
 except ImportError:
     HAS_STATSMODELS = False
-    logger.warning("Statsmodels not available, STL decomposition disabled")
+    logger.warning("statsmodels not available, STL decomposition disabled")
 
 try:
-    from prophet import Prophet
+    # Try different prophet import names
+    try:
+        from prophet import Prophet
+    except ImportError:
+        from fbprophet import Prophet
 except ImportError:
     HAS_PROPHET = False
-    logger.warning("Prophet not available, forecasting limited")
+    logger.warning("Prophet not available, forecasting features disabled")
+
+try:
+    from scipy import stats
+    from scipy.signal import find_peaks
+except ImportError:
+    HAS_SCIPY = False
+    logger.warning("SciPy not available, some statistical functions disabled")
+
+# Data classes for structured results
+@dataclass
+class Anomaly:
+    """Represents a detected anomaly."""
+    feature: str
+    timestamp: datetime
+    score: float
+    frequency: str
+    anomaly_type: str
+    confidence: float
+
+@dataclass
+class ModelMetrics:
+    """Performance metrics for model evaluation."""
+    model_name: str
+    processing_time: float
+    features_processed: int
+    anomalies_detected: int
+    memory_usage_mb: float
+    frequency: str
 
 # Setup paths
 ROOT = Path(__file__).resolve().parents[1]
@@ -79,7 +106,7 @@ INTERIM_DIR = ROOT / "data" / "interim"
 CACHE_DIR = ROOT / "data" / "cache"
 
 # Performance configuration
-PERFORMANCE_MODE = "OPTIMIZED"  # OPTIMIZED, BALANCED, THOROUGH
+PERFORMANCE_MODE = "BALANCED"  # OPTIMIZED, BALANCED, THOROUGH
 
 PERF_CONFIGS = {
     "OPTIMIZED": {
@@ -202,6 +229,25 @@ class OptimizedCache:
             with open(cache_file, 'rb') as f:
                 return pickle.load(f)
         except Exception as e:
+            logger.warning(f"Failed to load cache {cache_key}: {e}")
+            return None
+    
+    def set(self, data_key: str, params: Dict, data: Any):
+        """Cache data with cleanup if needed."""
+        self._cleanup_old_cache()
+        
+        cache_key = self._get_cache_key(data_key, params)
+        cache_file = self.cache_dir / f"{cache_key}.pkl"
+        
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(data, f)
+        except Exception as e:
+            logger.warning(f"Failed to cache data {cache_key}: {e}")
+            
+            with open(cache_file, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
             logger.warning(f"Cache read failed: {e}")
             if cache_file.exists():
                 cache_file.unlink()
@@ -245,73 +291,116 @@ def force_garbage_collection():
 # Optimized Data Loading
 # -----------------------------
 
-def load_processed_features_optimized() -> Dict[str, pd.DataFrame]:
+def load_processed_features_optimized_wrapper() -> Dict[str, pd.DataFrame]:
     """Load processed features with memory optimization and smart sampling."""
     logger.info("Loading processed features with optimization")
     
-    datasets: Dict[str, pd.DataFrame] = {}
+    # Use correct path - processed data is in data/processed/dataset
+    data_dir = ROOT / "data" / "processed" / "dataset"
+    
+    datasets = {}
     memory_used = 0
     
-    # Find feature files
-    feature_patterns = [
-        "features_hashtags_*.parquet",
-        "features_keywords_*.parquet", 
-        "features_emerging_terms_*.parquet"
-    ]
+    file_types = ['hashtags', 'keywords', 'emerging_terms']
     
-    for pattern in feature_patterns:
-        for filepath in PROC_DIR.glob(pattern):
-            if 'statistical_anomalies' in filepath.name:
+    pattern_files = []
+    for file_type in file_types:
+        pattern_files.extend(data_dir.glob(f"features_{file_type}_*.parquet"))
+    
+    logger.info(f"Found {len(pattern_files)} files to process")
+    
+    for filepath in pattern_files:
+        if not filepath.exists():
+            continue
+            
+        file_size_mb = filepath.stat().st_size / (1024 * 1024)
+        
+        # Skip extremely large files if in optimized mode
+        if PERFORMANCE_MODE == "OPTIMIZED" and file_size_mb > 100:
+            logger.warning(f"Skipping large file {filepath.name} ({file_size_mb:.1f}MB)")
+            continue
+            
+        try:
+            df = pd.read_parquet(filepath)
+            if df.empty:
+                logger.warning(f"Empty dataset: {filepath.name}")
                 continue
             
-            try:
-                # Check file size first
-                file_size_mb = filepath.stat().st_size / (1024 * 1024)
-                
-                # Load with memory check
-                if not check_memory_limit():
-                    logger.warning("Memory limit reached, stopping data loading")
+            # Extract frequency from filename
+            frequency = None
+            for freq in AGG_FREQUENCIES:
+                if f"_{freq}.parquet" in filepath.name:
+                    frequency = freq
                     break
+            
+            if not frequency:
+                logger.warning(f"Could not extract frequency from {filepath.name}")
+                continue
+            
+            # Apply sampling if configured
+            sample_size = CONFIG.get("anomaly_sample_size")
+            if sample_size and len(df) > sample_size:
+                df = df.sample(n=sample_size, random_state=42)
+                logger.info(f"Sampled {filepath.name} to {sample_size} rows")
+            
+            # Ensure required columns exist
+            required_cols = ['feature', 'count', 'bin']
+            if not all(col in df.columns for col in required_cols):
+                logger.warning(f"Missing required columns in {filepath.name}: {df.columns.tolist()}")
+                continue
+            
+            # Convert bin to datetime if needed (rename to time_bin for consistency)
+            if not pd.api.types.is_datetime64_any_dtype(df['bin']):
+                df['bin'] = pd.to_datetime(df['bin'])
+            
+            # Rename for consistency with downstream code
+            df['time_bin'] = df['bin']
+            
+            # Sort by time for trend analysis
+            df = df.sort_values('time_bin')
+            
+            # Add frequency column for processing
+            df['frequency'] = frequency
+            
+            # Remove duplicates by aggregating counts for same feature+time combinations
+            if len(df) != len(df[['feature', 'time_bin']].drop_duplicates()):
+                logger.info(f"Removing duplicates in {filepath.name}")
+                # Sum counts for duplicate feature+time combinations
+                agg_dict = {
+                    'count': 'sum',
+                    'frequency': 'first'
+                }
+                # Add other columns to aggregation
+                for col in df.columns:
+                    if col not in ['feature', 'time_bin', 'count', 'frequency']:
+                        agg_dict[col] = 'first'
                 
-                df = pd.read_parquet(filepath)
+                df = df.groupby(['feature', 'time_bin'], as_index=False).agg(agg_dict)
+            
+            # Apply feature limits for performance
+            if 'feature' in df.columns:
+                max_features = CONFIG["max_features_per_frequency"]
+                if max_features and df['feature'].nunique() > max_features:
+                    # Keep top features by total count
+                    top_features = (df.groupby('feature')['count'].sum()
+                                  .nlargest(max_features).index)
+                    df = df[df['feature'].isin(top_features)]
+                    logger.info(f"Limited {filepath.name} to top {max_features} features")
+            
+            dataset_key = f"{filepath.stem}_{frequency}"
+            datasets[dataset_key] = df
+            memory_used += file_size_mb
+            
+            logger.info(f"Loaded {filepath.name}: {len(df):,} rows, {file_size_mb:.1f}MB")
+            
+            # Force GC if memory usage is high
+            if memory_used > 200:  # 200MB threshold
+                force_garbage_collection()
+                memory_used = 0
                 
-                if df.empty:
-                    continue
-                
-                # Extract frequency from filename
-                parts = filepath.stem.split('_')
-                frequency = parts[-1] if parts else 'unknown'
-                df['frequency'] = frequency
-                
-                # Apply feature limits for performance
-                if 'feature' in df.columns:
-                    max_features = CONFIG["max_features_per_frequency"]
-                    if max_features and df['feature'].nunique() > max_features:
-                        # Keep top features by total count
-                        top_features = (df.groupby('feature')['count'].sum()
-                                      .nlargest(max_features).index)
-                        df = df[df['feature'].isin(top_features)]
-                        logger.info(f"Limited {filepath.name} to top {max_features} features")
-                
-                # Memory-based sampling for large datasets
-                dataset_size_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
-                if dataset_size_mb > 50:  # 50MB threshold
-                    sample_ratio = min(1.0, 50 / dataset_size_mb)
-                    df = df.sample(frac=sample_ratio, random_state=42)
-                    logger.info(f"Sampled {filepath.name} to {sample_ratio:.2%} of original size")
-                
-                datasets[filepath.stem] = df
-                memory_used += dataset_size_mb
-                
-                logger.info(f"Loaded {filepath.name}: {len(df):,} rows, {dataset_size_mb:.1f}MB")
-                
-                # Force GC if memory usage is high
-                if memory_used > 200:  # 200MB threshold
-                    force_garbage_collection()
-                    memory_used = 0
-                
-            except Exception as e:
-                logger.error(f"Failed to load {filepath}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to load {filepath}: {e}")
+            continue
     
     logger.info(f"Loaded {len(datasets)} datasets, total memory: {get_memory_usage():.1f}MB")
     return datasets
@@ -368,6 +457,10 @@ class StreamingAnomalyDetector:
                 logger.debug(f"Processed {i}/{len(features)} features")
             
             feature_data = df[df['feature'] == feature].sort_values('bin')
+            
+            # Handle duplicates by aggregating counts for same timestamps
+            if len(feature_data) != len(feature_data['bin'].drop_duplicates()):
+                feature_data = feature_data.groupby('bin', as_index=False)['count'].sum()
             
             if len(feature_data) < 5:  # Need minimum data points
                 continue
@@ -475,51 +568,69 @@ class OptimizedSTLDetector:
             
             feature_data = df[df['feature'] == feature].sort_values('bin')
             
-            if len(feature_data) < self.period * 2:
+            if len(feature_data) < self.period * 2:  # Need enough data for STL
                 continue
             
             try:
-                # Create time series
-                ts = feature_data.set_index('bin')['count']
-                ts.index = pd.to_datetime(ts.index)
+                # Prepare time series data with duplicate handling
+                # Aggregate duplicates by summing counts for same timestamp
+                feature_data_clean = feature_data.groupby('bin')['count'].sum().reset_index()
                 
-                # STL decomposition
-                stl = STL(ts, seasonal=self.seasonal, period=self.period)
-                decomposition = stl.fit()
+                # Create time series with clean data
+                ts_data = feature_data_clean.set_index('bin')['count']
                 
-                # Anomaly detection on residuals
-                residuals = decomposition.resid
-                threshold = 3.0 * residuals.std()
+                # Ensure index is datetime and sort
+                ts_data.index = pd.to_datetime(ts_data.index)
+                ts_data = ts_data.sort_index()
                 
-                anomaly_mask = np.abs(residuals) > threshold
-                anomaly_indices = ts.index[anomaly_mask]
+                # Remove any remaining duplicates (keep last)
+                ts_data = ts_data[~ts_data.index.duplicated(keep='last')]
                 
-                for idx in anomaly_indices:
-                    resid_val = residuals.loc[idx]
-                    if isinstance(resid_val, pd.Series):
-                        resid_val = resid_val.iloc[0]
-                    
-                    score = abs(resid_val) / residuals.std() if residuals.std() > 0 else 0
-                    
-                    anomaly = Anomaly(
-                        feature=feature,
-                        timestamp=idx,
-                        score=float(score),
-                        frequency=frequency,
-                        anomaly_type="stl_residual",
-                        confidence=min(1.0, score / 5.0)
-                    )
-                    anomalies.append(anomaly)
+                # Resample to regular frequency to fill gaps
+                ts_data = ts_data.asfreq(self._get_frequency_rule(frequency), method='ffill')
                 
+                # Ensure we have enough data points after cleaning
+                if len(ts_data) < self.period * 2:
+                    continue
+                
+                # Apply STL decomposition
+                stl = STL(ts_data, seasonal=self.seasonal, period=self.period)
+                result = stl.fit()
+                
+                # Calculate residuals and detect anomalies
+                residuals = result.resid
+                threshold = 2.0 * np.std(residuals)
+                
+                # Find anomalous points
+                for idx, residual in residuals.items():
+                    if abs(residual) > threshold:
+                        anomaly = Anomaly(
+                            feature=feature,
+                            timestamp=idx,
+                            score=abs(residual) / threshold,
+                            frequency=frequency,
+                            anomaly_type="stl_residual",
+                            confidence=min(1.0, abs(residual) / (3 * threshold))
+                        )
+                        anomalies.append(anomaly)
+                        
             except Exception as e:
-                logger.debug(f"STL failed for feature {feature}: {e}")
+                logger.warning(f"STL failed for feature {feature}: {e}")
                 continue
         
         # Cache results
         model_cache.set(cache_key, params, anomalies)
-        
         logger.info(f"STL detected {len(anomalies)} anomalies in {frequency}")
         return anomalies
+    
+    def _get_frequency_rule(self, frequency: str) -> str:
+        """Convert frequency to pandas frequency rule."""
+        freq_map = {
+            '1h': 'H', '3h': '3H', '6h': '6H',
+            '1d': 'D', '3d': '3D', '7d': '7D', '14d': '14D',
+            '1m': 'M', '3m': '3M', '6m': '6M'
+        }
+        return freq_map.get(frequency, 'H')
 
 # -----------------------------
 # Parallel Processing Framework
@@ -827,7 +938,7 @@ def main_optimized_modeling():
     
     # Load processed features with optimization
     logger.info("Loading processed feature datasets")
-    datasets = load_processed_features_optimized()
+    datasets = load_processed_features_optimized_wrapper()
     
     if not datasets:
         logger.error("No processed feature datasets found. Run Phase 2 first.")
