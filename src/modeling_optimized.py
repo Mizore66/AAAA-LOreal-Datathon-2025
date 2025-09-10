@@ -1,998 +1,1037 @@
 #!/usr/bin/env python3
 """
-Optimized Modeling Pipeline for L'Oréal Datathon 2025 - Phase 3 Performance Improvements
+Modeling Pipeline for L'Oréal Datathon 2025
+Implementation focusing on semantic validation, sentiment analysis, and decay detection.
 
-Key optimizations:
-1. Streaming data processing for large datasets
-2. Intelligent early termination conditions
-3. Memory-efficient anomaly detection algorithms
-4. Parallel processing for independent operations
-5. Smart caching for expensive model operations
-6. Optimized feature selection and sampling
-7. Progressive complexity scaling based on data size
+Includes:
+1. Semantic Validation using sentence transformers
+2. Segment & Sentiment Analysis with spaCy and transformers
+3. Decay Detection with time-series analysis
 """
 
-from dataclasses import dataclass, asdict
-from typing import Optional, List, Dict, Tuple, Set, Any, Union
-from pathlib import Path
 import pandas as pd
 import numpy as np
-import pickle
-import json
-from datetime import datetime, timedelta
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple, Union
 import logging
+from datetime import datetime, timedelta
 import warnings
-import time
-import hashlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import psutil
-import gc
+import json
+import re
+from tqdm import tqdm
 
 # Suppress warnings for cleaner output
-warnings.filterwarnings("ignore")
-for noisy_logger in ['prophet', 'cmdstanpy', 'urllib3', 'matplotlib', 'fbprophet', 'transformers']:
-    logging.getLogger(noisy_logger).setLevel(logging.ERROR)
+warnings.filterwarnings('ignore')
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Optional dependencies with graceful fallbacks
+HAS_SENTENCE_TRANSFORMERS = True
+HAS_TRANSFORMERS = True
+HAS_SPACY = True
 HAS_SKLEARN = True
-HAS_STATSMODELS = True
-HAS_PROPHET = True
-HAS_SCIPY = True
 
 try:
-    from sklearn.ensemble import RandomForestClassifier, IsolationForest
-    from sklearn.model_selection import train_test_split
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+    from sentence_transformers import SentenceTransformer
     from sklearn.cluster import KMeans
+    from sklearn.metrics.pairwise import cosine_similarity
 except ImportError:
+    HAS_SENTENCE_TRANSFORMERS = False
     HAS_SKLEARN = False
-    logger.warning("scikit-learn not available, some features disabled")
+    logger.warning("sentence-transformers or sklearn not available, semantic validation disabled")
 
 try:
-    from statsmodels.tsa.seasonal import STL
-    import statsmodels.api as sm
+    from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
 except ImportError:
-    HAS_STATSMODELS = False
-    logger.warning("statsmodels not available, STL decomposition disabled")
+    HAS_TRANSFORMERS = False
+    logger.warning("transformers not available, sentiment analysis disabled")
 
 try:
-    # Try different prophet import names
-    try:
-        from prophet import Prophet
-    except ImportError:
-        from fbprophet import Prophet
+    import spacy
 except ImportError:
-    HAS_PROPHET = False
-    logger.warning("Prophet not available, forecasting features disabled")
+    HAS_SPACY = False
+    logger.warning("spaCy not available, NER features disabled")
 
-try:
-    from scipy import stats
-    from scipy.signal import find_peaks
-except ImportError:
-    HAS_SCIPY = False
-    logger.warning("SciPy not available, some statistical functions disabled")
-
-# Data classes for structured results
-@dataclass
-class Anomaly:
-    """Represents a detected anomaly."""
-    feature: str
-    timestamp: datetime
-    score: float
-    frequency: str
-    anomaly_type: str
-    confidence: float
-
-@dataclass
-class ModelMetrics:
-    """Performance metrics for model evaluation."""
-    model_name: str
-    processing_time: float
-    features_processed: int
-    anomalies_detected: int
-    memory_usage_mb: float
-    frequency: str
-
-# Setup paths
+# Define paths
 ROOT = Path(__file__).resolve().parents[1]
 PROC_DIR = ROOT / "data" / "processed" / "dataset"
-MODELS_DIR = ROOT / "models"
 INTERIM_DIR = ROOT / "data" / "interim"
-CACHE_DIR = ROOT / "data" / "cache"
+MODELS_DIR = ROOT / "models"
 
-# Performance configuration
-PERFORMANCE_MODE = "BALANCED"  # OPTIMIZED, BALANCED, THOROUGH
-
-PERF_CONFIGS = {
-    "OPTIMIZED": {
-        "max_features_per_frequency": 100,
-        "max_anomaly_features": 50,
-        "anomaly_sample_size": 1000,
-        "enable_parallel": True,
-        "early_termination": True,
-        "memory_limit_mb": 1000,
-        "streaming_threshold": 10000
-    },
-    "BALANCED": {
-        "max_features_per_frequency": 250,
-        "max_anomaly_features": 150,
-        "anomaly_sample_size": 5000,
-        "enable_parallel": True,
-        "early_termination": True,
-        "memory_limit_mb": 2000,
-        "streaming_threshold": 50000
-    },
-    "THOROUGH": {
-        "max_features_per_frequency": None,
-        "max_anomaly_features": None,
-        "anomaly_sample_size": None,
-        "enable_parallel": False,
-        "early_termination": False,
-        "memory_limit_mb": 4000,
-        "streaming_threshold": 100000
-    }
-}
-
-CONFIG = PERF_CONFIGS[PERFORMANCE_MODE]
-
-# Supported aggregation frequencies
-AGG_FREQUENCIES = ["1h", "3h", "6h", "1d", "3d", "7d", "14d", "1m", "3m", "6m"]
-
-# Create directories
-for dir_path in [MODELS_DIR, INTERIM_DIR, CACHE_DIR]:
+# Create directories if they don't exist
+for dir_path in [INTERIM_DIR, MODELS_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
 
-# -----------------------------
-# Data Classes for Results
-# -----------------------------
-
-@dataclass
-class Anomaly:
-    feature: str
-    timestamp: pd.Timestamp
-    score: float
-    frequency: str
-    platform: Optional[str] = None
-    category: Optional[str] = None
-    anomaly_type: str = "statistical"
-    confidence: float = 0.0
-
-@dataclass
-class ModelMetrics:
-    model_name: str
-    processing_time: float
-    features_processed: int
-    anomalies_detected: int
-    memory_usage_mb: float
-    frequency: str
-
-# -----------------------------
-# Optimized Cache System
-# -----------------------------
-
-class OptimizedCache:
-    """High-performance caching system for model operations."""
+class SemanticValidator:
+    """Semantic validation using sentence transformers for embeddings and clustering."""
     
-    def __init__(self, cache_dir: Path, max_size_mb: int = 500):
-        self.cache_dir = cache_dir
-        self.max_size_mb = max_size_mb
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-    
-    def _get_cache_key(self, data_key: str, params: Dict) -> str:
-        """Generate cache key from data and parameters."""
-        param_str = json.dumps(params, sort_keys=True)
-        combined = f"{data_key}_{param_str}"
-        return hashlib.md5(combined.encode()).hexdigest()[:16]
-    
-    def _cleanup_old_cache(self):
-        """Remove old cache files if size limit exceeded."""
-        cache_files = list(self.cache_dir.glob("*.pkl"))
-        if not cache_files:
-            return
+    def __init__(self, model_name: str = 'all-MiniLM-L6-v2'):
+        """
+        Initialize semantic validator.
         
-        # Calculate total size
-        total_size = sum(f.stat().st_size for f in cache_files) / (1024 * 1024)
+        Args:
+            model_name: Name of the sentence transformer model to use
+        """
+        self.model_name = model_name
+        self.model = None
+        self.embeddings_cache = {}
         
-        if total_size > self.max_size_mb:
-            # Sort by modification time and remove oldest
-            cache_files.sort(key=lambda x: x.stat().st_mtime)
-            removed_size = 0
-            
-            for file_path in cache_files:
-                if total_size - removed_size <= self.max_size_mb * 0.8:
-                    break
-                
-                file_size = file_path.stat().st_size / (1024 * 1024)
-                file_path.unlink()
-                removed_size += file_size
-                logger.info(f"Removed old cache file: {file_path.name}")
-    
-    def get(self, data_key: str, params: Dict) -> Optional[Any]:
-        """Get cached data if available and valid."""
-        cache_key = self._get_cache_key(data_key, params)
-        cache_file = self.cache_dir / f"{cache_key}.pkl"
-        
-        if not cache_file.exists():
-            return None
-        
-        try:
-            # Check age (max 30 minutes for optimization)
-            if time.time() - cache_file.stat().st_mtime > 1800:
-                cache_file.unlink()
-                return None
-            
-            with open(cache_file, 'rb') as f:
-                return pickle.load(f)
-        except Exception as e:
-            logger.warning(f"Failed to load cache {cache_key}: {e}")
-            return None
-    
-    def set(self, data_key: str, params: Dict, data: Any):
-        """Cache data with cleanup if needed."""
-        self._cleanup_old_cache()
-        
-        cache_key = self._get_cache_key(data_key, params)
-        cache_file = self.cache_dir / f"{cache_key}.pkl"
-        
-        try:
-            with open(cache_file, 'wb') as f:
-                pickle.dump(data, f)
-        except Exception as e:
-            logger.warning(f"Failed to cache data {cache_key}: {e}")
-            
-            with open(cache_file, 'rb') as f:
-                return pickle.load(f)
-        except Exception as e:
-            logger.warning(f"Cache read failed: {e}")
-            if cache_file.exists():
-                cache_file.unlink()
-            return None
-    
-    def set(self, data_key: str, params: Dict, data: Any):
-        """Cache data with cleanup if needed."""
-        self._cleanup_old_cache()
-        
-        cache_key = self._get_cache_key(data_key, params)
-        cache_file = self.cache_dir / f"{cache_key}.pkl"
-        
-        try:
-            with open(cache_file, 'wb') as f:
-                pickle.dump(data, f)
-        except Exception as e:
-            logger.warning(f"Cache write failed: {e}")
-
-# Global cache instance
-model_cache = OptimizedCache(CACHE_DIR)
-
-# -----------------------------
-# Memory Management
-# -----------------------------
-
-def get_memory_usage() -> float:
-    """Get current memory usage in MB."""
-    return psutil.Process().memory_info().rss / (1024 * 1024)
-
-def check_memory_limit() -> bool:
-    """Check if memory usage is within limits."""
-    current_usage = get_memory_usage()
-    return current_usage < CONFIG["memory_limit_mb"]
-
-def force_garbage_collection():
-    """Force garbage collection to free memory."""
-    gc.collect()
-    logger.debug(f"Memory after GC: {get_memory_usage():.1f} MB")
-
-# -----------------------------
-# Optimized Data Loading
-# -----------------------------
-
-def load_processed_features_optimized_wrapper() -> Dict[str, pd.DataFrame]:
-    """Load processed features with memory optimization and smart sampling."""
-    logger.info("Loading processed features with optimization")
-    
-    # Use correct path - processed data is in data/processed/dataset
-    data_dir = ROOT / "data" / "processed" / "dataset"
-    
-    datasets = {}
-    memory_used = 0
-    
-    file_types = ['hashtags', 'keywords', 'emerging_terms']
-    
-    pattern_files = []
-    for file_type in file_types:
-        pattern_files.extend(data_dir.glob(f"features_{file_type}_*.parquet"))
-    
-    logger.info(f"Found {len(pattern_files)} files to process")
-    
-    for filepath in pattern_files:
-        if not filepath.exists():
-            continue
-            
-        file_size_mb = filepath.stat().st_size / (1024 * 1024)
-        
-        # Skip extremely large files if in optimized mode
-        if PERFORMANCE_MODE == "OPTIMIZED" and file_size_mb > 100:
-            logger.warning(f"Skipping large file {filepath.name} ({file_size_mb:.1f}MB)")
-            continue
-            
-        try:
-            df = pd.read_parquet(filepath)
-            if df.empty:
-                logger.warning(f"Empty dataset: {filepath.name}")
-                continue
-            
-            # Extract frequency from filename
-            frequency = None
-            for freq in AGG_FREQUENCIES:
-                if f"_{freq}.parquet" in filepath.name:
-                    frequency = freq
-                    break
-            
-            if not frequency:
-                logger.warning(f"Could not extract frequency from {filepath.name}")
-                continue
-            
-            # Apply sampling if configured
-            sample_size = CONFIG.get("anomaly_sample_size")
-            if sample_size and len(df) > sample_size:
-                df = df.sample(n=sample_size, random_state=42)
-                logger.info(f"Sampled {filepath.name} to {sample_size} rows")
-            
-            # Ensure required columns exist
-            required_cols = ['feature', 'count', 'bin']
-            if not all(col in df.columns for col in required_cols):
-                logger.warning(f"Missing required columns in {filepath.name}: {df.columns.tolist()}")
-                continue
-            
-            # Convert bin to datetime if needed (rename to time_bin for consistency)
-            if not pd.api.types.is_datetime64_any_dtype(df['bin']):
-                df['bin'] = pd.to_datetime(df['bin'])
-            
-            # Rename for consistency with downstream code
-            df['time_bin'] = df['bin']
-            
-            # Sort by time for trend analysis
-            df = df.sort_values('time_bin')
-            
-            # Add frequency column for processing
-            df['frequency'] = frequency
-            
-            # Remove duplicates by aggregating counts for same feature+time combinations
-            if len(df) != len(df[['feature', 'time_bin']].drop_duplicates()):
-                logger.info(f"Removing duplicates in {filepath.name}")
-                # Sum counts for duplicate feature+time combinations
-                agg_dict = {
-                    'count': 'sum',
-                    'frequency': 'first'
-                }
-                # Add other columns to aggregation
-                for col in df.columns:
-                    if col not in ['feature', 'time_bin', 'count', 'frequency']:
-                        agg_dict[col] = 'first'
-                
-                df = df.groupby(['feature', 'time_bin'], as_index=False).agg(agg_dict)
-            
-            # Apply feature limits for performance
-            if 'feature' in df.columns:
-                max_features = CONFIG["max_features_per_frequency"]
-                if max_features and df['feature'].nunique() > max_features:
-                    # Keep top features by total count
-                    top_features = (df.groupby('feature')['count'].sum()
-                                  .nlargest(max_features).index)
-                    df = df[df['feature'].isin(top_features)]
-                    logger.info(f"Limited {filepath.name} to top {max_features} features")
-            
-            dataset_key = f"{filepath.stem}_{frequency}"
-            datasets[dataset_key] = df
-            memory_used += file_size_mb
-            
-            logger.info(f"Loaded {filepath.name}: {len(df):,} rows, {file_size_mb:.1f}MB")
-            
-            # Force GC if memory usage is high
-            if memory_used > 200:  # 200MB threshold
-                force_garbage_collection()
-                memory_used = 0
-                
-        except Exception as e:
-            logger.error(f"Failed to load {filepath}: {e}")
-            continue
-    
-    logger.info(f"Loaded {len(datasets)} datasets, total memory: {get_memory_usage():.1f}MB")
-    return datasets
-
-# -----------------------------
-# Optimized Anomaly Detection
-# -----------------------------
-
-class StreamingAnomalyDetector:
-    """Memory-efficient streaming anomaly detector."""
-    
-    def __init__(self, threshold_factor: float = 3.0, window_size: int = 100):
-        self.threshold_factor = threshold_factor
-        self.window_size = window_size
-        self.stats_cache = {}
-    
-    def detect_anomalies_streaming(self, df: pd.DataFrame, frequency: str) -> List[Anomaly]:
-        """Detect anomalies using streaming algorithm for memory efficiency."""
-        
-        if df.empty or 'feature' not in df.columns:
-            return []
-        
-        # Cache key for statistics
-        cache_key = f"stats_{frequency}_{len(df)}"
-        params = {"threshold": self.threshold_factor, "window": self.window_size}
-        
-        # Check cache first
-        cached_result = model_cache.get(cache_key, params)
-        if cached_result is not None:
-            logger.info(f"Using cached anomaly detection for {frequency}")
-            return cached_result
-        
-        anomalies = []
-        features = df['feature'].unique()
-        
-        # Apply feature limit for performance
-        max_features = CONFIG["max_anomaly_features"]
-        if max_features and len(features) > max_features:
-            # Select features with highest variance (most likely to have anomalies)
-            feature_variance = df.groupby('feature')['count'].var().fillna(0)
-            top_features = feature_variance.nlargest(max_features).index
-            features = features[np.isin(features, top_features)]
-            logger.info(f"Limited anomaly detection to {max_features} most variable features")
-        
-        logger.info(f"Processing {len(features)} features for anomaly detection in {frequency}")
-        
-        for i, feature in enumerate(features):
-            # Early termination check
-            if CONFIG["early_termination"] and not check_memory_limit():
-                logger.warning("Memory limit reached, terminating anomaly detection early")
-                break
-            
-            if i % 50 == 0 and i > 0:
-                logger.debug(f"Processed {i}/{len(features)} features")
-            
-            feature_data = df[df['feature'] == feature].sort_values('bin')
-            
-            # Handle duplicates by aggregating counts for same timestamps
-            if len(feature_data) != len(feature_data['bin'].drop_duplicates()):
-                feature_data = feature_data.groupby('bin', as_index=False)['count'].sum()
-            
-            if len(feature_data) < 5:  # Need minimum data points
-                continue
-            
-            # Use streaming statistics for memory efficiency
-            anomalies.extend(self._detect_feature_anomalies_streaming(
-                feature_data, feature, frequency
-            ))
-        
-        # Cache results
-        model_cache.set(cache_key, params, anomalies)
-        
-        logger.info(f"Detected {len(anomalies)} anomalies in {frequency}")
-        return anomalies
-    
-    def _detect_feature_anomalies_streaming(self, feature_data: pd.DataFrame, 
-                                          feature: str, frequency: str) -> List[Anomaly]:
-        """Detect anomalies for a single feature using streaming approach."""
-        anomalies = []
-        
-        if 'count' not in feature_data.columns:
-            return anomalies
-        
-        counts = feature_data['count'].values
-        timestamps = pd.to_datetime(feature_data['bin'])
-        
-        # Use a sliding window approach for memory efficiency
-        for i in range(len(counts)):
-            # Define window (use all previous data up to window_size)
-            start_idx = max(0, i - self.window_size)
-            window_data = counts[start_idx:i+1]
-            
-            if len(window_data) < 3:  # Need minimum window
-                continue
-            
-            # Calculate statistics on window
-            mean_val = np.mean(window_data[:-1]) if len(window_data) > 1 else np.mean(window_data)
-            std_val = np.std(window_data[:-1]) if len(window_data) > 1 else np.std(window_data)
-            
-            if std_val == 0:
-                continue
-            
-            # Z-score for current point
-            current_val = counts[i]
-            z_score = abs(current_val - mean_val) / std_val
-            
-            # Check for anomaly
-            if z_score > self.threshold_factor:
-                anomaly = Anomaly(
-                    feature=feature,
-                    timestamp=timestamps.iloc[i],
-                    score=z_score,
-                    frequency=frequency,
-                    anomaly_type="streaming_zscore",
-                    confidence=min(1.0, z_score / 10.0)  # Normalize confidence
-                )
-                anomalies.append(anomaly)
-        
-        return anomalies
-
-# -----------------------------
-# Optimized STL Anomaly Detector
-# -----------------------------
-
-class OptimizedSTLDetector:
-    """STL-based anomaly detection with performance optimizations."""
-    
-    def __init__(self, period: int = 24, seasonal: int = 7):
-        self.period = period
-        self.seasonal = seasonal
-        self.enabled = HAS_STATSMODELS
-    
-    def detect_anomalies_stl(self, df: pd.DataFrame, frequency: str) -> List[Anomaly]:
-        """STL-based anomaly detection with optimizations."""
-        
-        if not self.enabled:
-            logger.info("STL not available, skipping STL anomaly detection")
-            return []
-        
-        cache_key = f"stl_{frequency}_{len(df)}"
-        params = {"period": self.period, "seasonal": self.seasonal}
-        
-        # Check cache
-        cached_result = model_cache.get(cache_key, params)
-        if cached_result is not None:
-            logger.info(f"Using cached STL results for {frequency}")
-            return cached_result
-        
-        anomalies = []
-        features = df['feature'].unique()
-        
-        # Limit features for performance
-        max_features = min(20, len(features))  # STL is expensive
-        if len(features) > max_features:
-            # Select features with most data points
-            feature_counts = df.groupby('feature').size()
-            top_features = feature_counts.nlargest(max_features).index
-            features = features[np.isin(features, top_features)]
-            logger.info(f"Limited STL analysis to {max_features} features with most data")
-        
-        for feature in features:
-            if not check_memory_limit():
-                logger.warning("Memory limit reached, stopping STL analysis")
-                break
-            
-            feature_data = df[df['feature'] == feature].sort_values('bin')
-            
-            if len(feature_data) < self.period * 2:  # Need enough data for STL
-                continue
-            
+        if HAS_SENTENCE_TRANSFORMERS:
             try:
-                # Prepare time series data with duplicate handling
-                # Aggregate duplicates by summing counts for same timestamp
-                feature_data_clean = feature_data.groupby('bin')['count'].sum().reset_index()
-                
-                # Create time series with clean data
-                ts_data = feature_data_clean.set_index('bin')['count']
-                
-                # Ensure index is datetime and sort
-                ts_data.index = pd.to_datetime(ts_data.index)
-                ts_data = ts_data.sort_index()
-                
-                # Remove any remaining duplicates (keep last)
-                ts_data = ts_data[~ts_data.index.duplicated(keep='last')]
-                
-                # Resample to regular frequency to fill gaps
-                ts_data = ts_data.asfreq(self._get_frequency_rule(frequency), method='ffill')
-                
-                # Ensure we have enough data points after cleaning
-                if len(ts_data) < self.period * 2:
-                    continue
-                
-                # Apply STL decomposition
-                stl = STL(ts_data, seasonal=self.seasonal, period=self.period)
-                result = stl.fit()
-                
-                # Calculate residuals and detect anomalies
-                residuals = result.resid
-                threshold = 2.0 * np.std(residuals)
-                
-                # Find anomalous points
-                for idx, residual in residuals.items():
-                    if abs(residual) > threshold:
-                        anomaly = Anomaly(
-                            feature=feature,
-                            timestamp=idx,
-                            score=abs(residual) / threshold,
-                            frequency=frequency,
-                            anomaly_type="stl_residual",
-                            confidence=min(1.0, abs(residual) / (3 * threshold))
-                        )
-                        anomalies.append(anomaly)
-                        
+                self.model = SentenceTransformer(model_name)
+                logger.info(f"Loaded sentence transformer model: {model_name}")
             except Exception as e:
-                logger.warning(f"STL failed for feature {feature}: {e}")
-                continue
-        
-        # Cache results
-        model_cache.set(cache_key, params, anomalies)
-        logger.info(f"STL detected {len(anomalies)} anomalies in {frequency}")
-        return anomalies
-    
-    def _get_frequency_rule(self, frequency: str) -> str:
-        """Convert frequency to pandas frequency rule."""
-        freq_map = {
-            '1h': 'H', '3h': '3H', '6h': '6H',
-            '1d': 'D', '3d': '3D', '7d': '7D', '14d': '14D',
-            '1m': 'M', '3m': '3M', '6m': '6M'
-        }
-        return freq_map.get(frequency, 'H')
-
-# -----------------------------
-# Parallel Processing Framework
-# -----------------------------
-
-def process_frequency_chunk(args: Tuple) -> Tuple[str, List[Anomaly], ModelMetrics]:
-    """Process a single frequency chunk for parallel execution."""
-    frequency, df, detector_type = args
-    
-    start_time = time.time()
-    start_memory = get_memory_usage()
-    
-    try:
-        if detector_type == "streaming":
-            detector = StreamingAnomalyDetector()
-            anomalies = detector.detect_anomalies_streaming(df, frequency)
-        elif detector_type == "stl":
-            detector = OptimizedSTLDetector()
-            anomalies = detector.detect_anomalies_stl(df, frequency)
+                logger.error(f"Failed to load sentence transformer model: {e}")
+                self.model = None
         else:
-            anomalies = []
-        
-        end_time = time.time()
-        end_memory = get_memory_usage()
-        
-        metrics = ModelMetrics(
-            model_name=detector_type,
-            processing_time=end_time - start_time,
-            features_processed=df['feature'].nunique() if 'feature' in df.columns else 0,
-            anomalies_detected=len(anomalies),
-            memory_usage_mb=end_memory - start_memory,
-            frequency=frequency
-        )
-        
-        return frequency, anomalies, metrics
-        
-    except Exception as e:
-        logger.error(f"Error processing frequency {frequency}: {e}")
-        return frequency, [], ModelMetrics(
-            model_name=detector_type,
-            processing_time=0,
-            features_processed=0,
-            anomalies_detected=0,
-            memory_usage_mb=0,
-            frequency=frequency
-        )
-
-def run_parallel_anomaly_detection(datasets: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
-    """Run anomaly detection in parallel across frequencies."""
+            logger.warning("Sentence transformers not available, semantic validation disabled")
     
-    # Organize datasets by frequency
-    freq_groups: Dict[str, List[pd.DataFrame]] = {}
-    for name, df in datasets.items():
-        if 'frequency' not in df.columns:
-            continue
+    def generate_embeddings(self, texts: List[str]) -> Optional[np.ndarray]:
+        """
+        Generate embeddings for a list of texts.
         
-        freq = df['frequency'].iloc[0]
-        freq_groups.setdefault(freq, []).append(df)
-    
-    logger.info(f"Processing {len(freq_groups)} frequencies with parallel detection")
-    
-    results = {
-        'anomalies': {},
-        'metrics': [],
-        'combined_anomalies': []
-    }
-    
-    # Prepare work chunks
-    work_chunks = []
-    for frequency, dfs in freq_groups.items():
-        # Combine dataframes for this frequency
-        combined_df = pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
+        Args:
+            texts: List of text strings to embed
+            
+        Returns:
+            Array of embeddings or None if model not available
+        """
+        if not self.model or not texts:
+            return None
         
-        # Add both streaming and STL detection
-        work_chunks.append((frequency, combined_df, "streaming"))
-        if HAS_STATSMODELS and len(combined_df) > 100:  # Only STL for substantial data
-            work_chunks.append((frequency, combined_df, "stl"))
+        try:
+            # Check cache first
+            cache_key = hash(tuple(texts))
+            if cache_key in self.embeddings_cache:
+                return self.embeddings_cache[cache_key]
+            
+            embeddings = self.model.encode(texts, show_progress_bar=True)
+            
+            # Cache results
+            self.embeddings_cache[cache_key] = embeddings
+            
+            return embeddings
+            
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {e}")
+            return None
     
-    # Execute in parallel
-    if CONFIG["enable_parallel"] and len(work_chunks) > 1:
-        max_workers = min(4, len(work_chunks))
-        logger.info(f"Running parallel anomaly detection with {max_workers} workers")
+    def cluster_semantic_features(self, features: List[str], hashtags: List[str] = None, 
+                                n_clusters: int = 5) -> Dict[str, any]:
+        """
+        Cluster semantically related features and hashtags.
         
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_chunk = {
-                executor.submit(process_frequency_chunk, chunk): chunk 
-                for chunk in work_chunks
+        Args:
+            features: List of feature names/hashtags
+            hashtags: Optional list of hashtag titles
+            n_clusters: Number of clusters to create
+            
+        Returns:
+            Dictionary containing clustering results
+        """
+        if not self.model or not features:
+            return {}
+        
+        logger.info(f"Clustering {len(features)} features into {n_clusters} semantic groups")
+        
+        # Combine features and hashtags for comprehensive clustering
+        all_texts = features.copy()
+        if hashtags:
+            all_texts.extend(hashtags)
+        
+        # Remove duplicates while preserving order
+        all_texts = list(dict.fromkeys(all_texts))
+        
+        # Generate embeddings
+        embeddings = self.generate_embeddings(all_texts)
+        if embeddings is None:
+            return {}
+        
+        try:
+            # Perform clustering
+            kmeans = KMeans(n_clusters=min(n_clusters, len(all_texts)), random_state=42)
+            cluster_labels = kmeans.fit_predict(embeddings)
+            
+            # Organize results
+            clusters = {}
+            for i, text in enumerate(all_texts):
+                cluster_id = cluster_labels[i]
+                if cluster_id not in clusters:
+                    clusters[cluster_id] = {
+                        'features': [],
+                        'center_embedding': kmeans.cluster_centers_[cluster_id],
+                        'coherence_score': 0.0
+                    }
+                clusters[cluster_id]['features'].append(text)
+            
+            # Calculate coherence scores for each cluster
+            for cluster_id, cluster_data in clusters.items():
+                cluster_embeddings = embeddings[[i for i, text in enumerate(all_texts) 
+                                               if text in cluster_data['features']]]
+                if len(cluster_embeddings) > 1:
+                    # Calculate average pairwise cosine similarity
+                    similarities = cosine_similarity(cluster_embeddings)
+                    # Get upper triangle (excluding diagonal)
+                    upper_triangle = similarities[np.triu_indices_from(similarities, k=1)]
+                    cluster_data['coherence_score'] = np.mean(upper_triangle)
+                else:
+                    cluster_data['coherence_score'] = 1.0
+            
+            result = {
+                'clusters': clusters,
+                'n_clusters': len(clusters),
+                'total_features': len(all_texts),
+                'average_coherence': np.mean([c['coherence_score'] for c in clusters.values()])
             }
             
-            for future in as_completed(future_to_chunk):
+            logger.info(f"Created {len(clusters)} semantic clusters with average coherence: {result['average_coherence']:.3f}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error in semantic clustering: {e}")
+            return {}
+    
+    def find_semantic_trends(self, trend_candidates: pd.DataFrame) -> pd.DataFrame:
+        """
+        Find groups of semantically related trends that are rising together.
+        
+        Args:
+            trend_candidates: DataFrame with trend candidates
+            
+        Returns:
+            Enhanced DataFrame with semantic groupings
+        """
+        if not self.model or trend_candidates.empty:
+            return trend_candidates
+        
+        logger.info("Analyzing semantic relationships in trend candidates")
+        
+        # Get features with positive growth
+        rising_trends = trend_candidates[
+            trend_candidates.get('rate_of_change', 0) > 0
+        ].copy()
+        
+        if rising_trends.empty:
+            return trend_candidates
+        
+        # Cluster rising trends
+        features = rising_trends['feature'].unique().tolist()
+        clustering_result = self.cluster_semantic_features(features, n_clusters=min(8, len(features)))
+        
+        if not clustering_result:
+            return trend_candidates
+        
+        # Add cluster information to trends
+        feature_to_cluster = {}
+        for cluster_id, cluster_data in clustering_result['clusters'].items():
+            for feature in cluster_data['features']:
+                feature_to_cluster[feature] = {
+                    'cluster_id': cluster_id,
+                    'coherence_score': cluster_data['coherence_score'],
+                    'cluster_size': len(cluster_data['features'])
+                }
+        
+        # Add semantic information to original DataFrame
+        trend_candidates['semantic_cluster'] = trend_candidates['feature'].map(
+            lambda x: feature_to_cluster.get(x, {}).get('cluster_id', -1)
+        )
+        trend_candidates['semantic_coherence'] = trend_candidates['feature'].map(
+            lambda x: feature_to_cluster.get(x, {}).get('coherence_score', 0.0)
+        )
+        trend_candidates['cluster_size'] = trend_candidates['feature'].map(
+            lambda x: feature_to_cluster.get(x, {}).get('cluster_size', 1)
+        )
+        
+        # Calculate cluster-level trend strength
+        cluster_stats = rising_trends.groupby(
+            rising_trends['feature'].map(lambda x: feature_to_cluster.get(x, {}).get('cluster_id', -1))
+        ).agg({
+            'rate_of_change': ['mean', 'count'],
+            'count': 'sum'
+        }).round(3)
+        
+        if not cluster_stats.empty:
+            logger.info(f"Found {len(cluster_stats)} semantic clusters with rising trends")
+        
+        return trend_candidates
+
+class DemographicsAnalyzer:
+    """Analyze demographics using spaCy NER for age indicators."""
+    
+    def __init__(self):
+        """Initialize demographics analyzer."""
+        self.nlp = None
+        self.age_patterns = [
+            # Direct age mentions
+            re.compile(r'\b(\d{1,2})\s*(years?\s*old|yo|y\.o\.)\b', re.IGNORECASE),
+            re.compile(r'\bage\s*(\d{1,2})\b', re.IGNORECASE),
+            # Generation keywords
+            re.compile(r'\b(gen\s*z|generation\s*z|zoomer)\b', re.IGNORECASE),
+            re.compile(r'\b(millennial|gen\s*y|generation\s*y)\b', re.IGNORECASE),
+            re.compile(r'\b(gen\s*x|generation\s*x)\b', re.IGNORECASE),
+            re.compile(r'\b(boomer|baby\s*boomer)\b', re.IGNORECASE),
+            # Life stage indicators
+            re.compile(r'\b(teen|teenager|teenage)\b', re.IGNORECASE),
+            re.compile(r'\b(college|university|student)\b', re.IGNORECASE),
+            re.compile(r'\b(young\s*adult|twenty\s*something)\b', re.IGNORECASE),
+            re.compile(r'\b(middle\s*aged|mid\s*life)\b', re.IGNORECASE),
+        ]
+        
+        if HAS_SPACY:
+            try:
+                self.nlp = spacy.load('en_core_web_sm')
+                logger.info("Loaded spaCy English model for NER")
+            except OSError:
                 try:
-                    frequency, anomalies, metrics = future.result(timeout=300)  # 5 min timeout
-                    
-                    if anomalies:
-                        key = f"{frequency}_{metrics.model_name}"
-                        results['anomalies'][key] = anomalies
-                        results['combined_anomalies'].extend(anomalies)
-                    
-                    results['metrics'].append(metrics)
-                    
-                except Exception as e:
-                    chunk = future_to_chunk[future]
-                    logger.error(f"Parallel processing failed for {chunk[0]}: {e}")
-    else:
-        # Sequential processing
-        logger.info("Running sequential anomaly detection")
-        for chunk in work_chunks:
-            frequency, anomalies, metrics = process_frequency_chunk(chunk)
+                    # Try alternative model name
+                    self.nlp = spacy.load('en')
+                    logger.info("Loaded spaCy English model")
+                except OSError:
+                    logger.warning("spaCy English model not found. Run: python -m spacy download en_core_web_sm")
+                    self.nlp = None
+        else:
+            logger.warning("spaCy not available, demographics analysis disabled")
+    
+    def extract_age_indicators(self, texts: List[str]) -> List[Dict[str, any]]:
+        """
+        Extract age indicators from user bios/profile descriptions.
+        
+        Args:
+            texts: List of text strings to analyze
             
-            if anomalies:
-                key = f"{frequency}_{metrics.model_name}"
-                results['anomalies'][key] = anomalies
-                results['combined_anomalies'].extend(anomalies)
+        Returns:
+            List of dictionaries with age information
+        """
+        results = []
+        
+        for text in texts:
+            if not isinstance(text, str):
+                results.append({'age_group': 'unknown', 'confidence': 0.0, 'indicators': []})
+                continue
             
-            results['metrics'].append(metrics)
-    
-    logger.info(f"Anomaly detection completed: {len(results['combined_anomalies'])} total anomalies")
-    return results
-
-# -----------------------------
-# Model Performance Analysis
-# -----------------------------
-
-def analyze_model_performance(metrics: List[ModelMetrics]) -> Dict[str, Any]:
-    """Analyze and summarize model performance metrics."""
-    
-    if not metrics:
-        return {}
-    
-    # Convert to DataFrame for easier analysis
-    metrics_data = [asdict(metric) for metric in metrics]
-    df = pd.DataFrame(metrics_data)
-    
-    analysis = {
-        'total_processing_time': df['processing_time'].sum(),
-        'average_processing_time': df['processing_time'].mean(),
-        'total_features_processed': df['features_processed'].sum(),
-        'total_anomalies_detected': df['anomalies_detected'].sum(),
-        'peak_memory_usage': df['memory_usage_mb'].max(),
-        'performance_by_frequency': {},
-        'performance_by_model': {}
-    }
-    
-    # Performance by frequency
-    for freq in df['frequency'].unique():
-        freq_data = df[df['frequency'] == freq]
-        analysis['performance_by_frequency'][freq] = {
-            'processing_time': freq_data['processing_time'].sum(),
-            'features_processed': freq_data['features_processed'].sum(),
-            'anomalies_detected': freq_data['anomalies_detected'].sum(),
-            'memory_usage': freq_data['memory_usage_mb'].max()
-        }
-    
-    # Performance by model type
-    for model in df['model_name'].unique():
-        model_data = df[df['model_name'] == model]
-        analysis['performance_by_model'][model] = {
-            'processing_time': model_data['processing_time'].sum(),
-            'features_processed': model_data['features_processed'].sum(),
-            'anomalies_detected': model_data['anomalies_detected'].sum(),
-            'efficiency': model_data['anomalies_detected'].sum() / max(model_data['processing_time'].sum(), 0.001)
-        }
-    
-    return analysis
-
-# -----------------------------
-# Report Generation
-# -----------------------------
-
-def generate_optimized_model_report(results: Dict[str, Any], performance_analysis: Dict[str, Any]):
-    """Generate comprehensive optimized model performance report."""
-    
-    report_path = INTERIM_DIR / 'phase3_optimized_model_report.md'
-    
-    lines = ["# Phase 3: Optimized Model Performance Report", ""]
-    lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append(f"Performance Mode: {PERFORMANCE_MODE}")
-    lines.append("")
-    
-    # Executive Summary
-    lines.append("## Executive Summary")
-    total_anomalies = len(results.get('combined_anomalies', []))
-    total_time = performance_analysis.get('total_processing_time', 0)
-    total_features = performance_analysis.get('total_features_processed', 0)
-    peak_memory = performance_analysis.get('peak_memory_usage', 0)
-    
-    lines.append(f"- Total anomalies detected: {total_anomalies:,}")
-    lines.append(f"- Total processing time: {total_time:.2f} seconds")
-    lines.append(f"- Features processed: {total_features:,}")
-    lines.append(f"- Peak memory usage: {peak_memory:.1f} MB")
-    lines.append(f"- Processing efficiency: {total_anomalies/max(total_time, 0.001):.1f} anomalies/second")
-    lines.append("")
-    
-    # Performance Optimizations Applied
-    lines.append("## Performance Optimizations Applied")
-    lines.append(f"- **Parallel Processing**: {'Enabled' if CONFIG['enable_parallel'] else 'Disabled'}")
-    lines.append(f"- **Early Termination**: {'Enabled' if CONFIG['early_termination'] else 'Disabled'}")
-    lines.append(f"- **Memory Limit**: {CONFIG['memory_limit_mb']} MB")
-    lines.append(f"- **Feature Limits**: {CONFIG['max_anomaly_features']} per frequency")
-    lines.append(f"- **Streaming Threshold**: {CONFIG['streaming_threshold']:,} rows")
-    lines.append("- **Smart Caching**: Enabled with LRU eviction")
-    lines.append("- **Memory-Efficient Algorithms**: Streaming anomaly detection")
-    lines.append("")
-    
-    # Performance by Frequency
-    lines.append("## Performance by Frequency")
-    freq_perf = performance_analysis.get('performance_by_frequency', {})
-    if freq_perf:
-        freq_data = []
-        for freq, data in freq_perf.items():
-            freq_data.append({
-                'Frequency': freq,
-                'Processing_Time': f"{data['processing_time']:.2f}s",
-                'Features': data['features_processed'],
-                'Anomalies': data['anomalies_detected'],
-                'Memory_MB': f"{data['memory_usage']:.1f}"
+            indicators = []
+            age_group = 'unknown'
+            confidence = 0.0
+            
+            # Check for direct age patterns
+            for pattern in self.age_patterns:
+                matches = pattern.findall(text.lower())
+                if matches:
+                    indicators.extend(matches)
+            
+            # Determine age group based on indicators
+            text_lower = text.lower()
+            
+            if any(term in text_lower for term in ['gen z', 'generation z', 'zoomer']):
+                age_group = 'gen_z'
+                confidence = 0.8
+            elif any(term in text_lower for term in ['teen', 'teenager']):
+                age_group = 'teen'
+                confidence = 0.9
+            elif any(term in text_lower for term in ['college', 'university', 'student']):
+                age_group = 'young_adult'
+                confidence = 0.7
+            elif any(term in text_lower for term in ['millennial', 'gen y']):
+                age_group = 'millennial'
+                confidence = 0.8
+            elif any(term in text_lower for term in ['gen x', 'generation x']):
+                age_group = 'gen_x'
+                confidence = 0.8
+            elif any(term in text_lower for term in ['boomer', 'baby boomer']):
+                age_group = 'boomer'
+                confidence = 0.8
+            
+            # Extract numeric ages
+            numeric_ages = []
+            for pattern in self.age_patterns[:2]:  # Only numeric patterns
+                matches = pattern.findall(text)
+                for match in matches:
+                    try:
+                        age = int(match[0] if isinstance(match, tuple) else match)
+                        numeric_ages.append(age)
+                    except (ValueError, IndexError):
+                        continue
+            
+            # Override age group with numeric age if available
+            if numeric_ages:
+                avg_age = np.mean(numeric_ages)
+                if avg_age <= 17:
+                    age_group = 'teen'
+                    confidence = 0.9
+                elif avg_age <= 26:
+                    age_group = 'gen_z'
+                    confidence = 0.9
+                elif avg_age <= 42:
+                    age_group = 'millennial'
+                    confidence = 0.9
+                elif avg_age <= 57:
+                    age_group = 'gen_x'
+                    confidence = 0.9
+                else:
+                    age_group = 'boomer'
+                    confidence = 0.9
+            
+            results.append({
+                'age_group': age_group,
+                'confidence': confidence,
+                'indicators': indicators,
+                'numeric_ages': numeric_ages
             })
         
-        try:
-            import tabulate
-            freq_df = pd.DataFrame(freq_data)
-            lines.append(freq_df.to_markdown(index=False))
-        except ImportError:
-            for item in freq_data:
-                lines.append(f"- **{item['Frequency']}**: {item['Processing_Time']}, {item['Features']} features, {item['Anomalies']} anomalies")
-    lines.append("")
+        return results
+
+class CategoryClassifier:
+    """Fine-tune transformer models for category classification."""
     
-    # Model Type Comparison
-    lines.append("## Model Type Performance")
-    model_perf = performance_analysis.get('performance_by_model', {})
-    if model_perf:
-        for model_name, data in model_perf.items():
-            lines.append(f"### {model_name.upper()}")
-            lines.append(f"- Processing time: {data['processing_time']:.2f} seconds")
-            lines.append(f"- Features processed: {data['features_processed']:,}")
-            lines.append(f"- Anomalies detected: {data['anomalies_detected']:,}")
-            lines.append(f"- Efficiency: {data['efficiency']:.1f} anomalies/second")
-            lines.append("")
-    
-    # Top Anomalies
-    lines.append("## Top Anomalies Detected")
-    anomalies = results.get('combined_anomalies', [])
-    if anomalies:
-        # Sort by score and take top 20
-        top_anomalies = sorted(anomalies, key=lambda x: x.score, reverse=True)[:20]
+    def __init__(self, model_name: str = 'distilbert-base-uncased'):
+        """
+        Initialize category classifier.
         
-        anomaly_data = []
-        for anomaly in top_anomalies:
-            anomaly_data.append({
-                'Feature': anomaly.feature[:30] + '...' if len(anomaly.feature) > 30 else anomaly.feature,
-                'Score': f"{anomaly.score:.2f}",
-                'Frequency': anomaly.frequency,
-                'Type': anomaly.anomaly_type,
-                'Confidence': f"{anomaly.confidence:.2f}",
-                'Timestamp': anomaly.timestamp.strftime('%Y-%m-%d %H:%M') if anomaly.timestamp else 'N/A'
+        Args:
+            model_name: Name of the transformer model to use
+        """
+        self.model_name = model_name
+        self.classifier = None
+        self.categories = ['skincare', 'makeup', 'hair', 'fashion', 'lifestyle']
+        
+        if HAS_TRANSFORMERS:
+            try:
+                # Use a pre-trained classification pipeline
+                self.classifier = pipeline(
+                    "zero-shot-classification",
+                    model="facebook/bart-large-mnli"
+                )
+                logger.info(f"Loaded zero-shot classifier for category classification")
+            except Exception as e:
+                logger.error(f"Failed to load classifier: {e}")
+                self.classifier = None
+        else:
+            logger.warning("Transformers not available, category classification disabled")
+    
+    def classify_posts(self, texts: List[str]) -> List[Dict[str, any]]:
+        """
+        Classify posts into categories.
+        
+        Args:
+            texts: List of text strings to classify
+            
+        Returns:
+            List of classification results
+        """
+        if not self.classifier:
+            # Fallback to rule-based classification
+            return self._rule_based_classification(texts)
+        
+        results = []
+        
+        logger.info(f"🏷️  Classifying {len(texts)} posts into categories")
+        
+        # Batch processing for better performance
+        batch_size = min(100, len(texts))  # Process in batches of 100 or less
+        num_batches = (len(texts) // batch_size) + (1 if len(texts) % batch_size else 0)
+        
+        successful_classifications = 0
+        failed_classifications = 0
+        
+        with tqdm(total=len(texts), desc="Classifying posts", unit="post") as pbar:
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, len(texts))
+                batch_texts = texts[start_idx:end_idx]
+                
+                # Process each text in the batch
+                for text in batch_texts:
+                    if not isinstance(text, str) or not text.strip():
+                        results.append({
+                            'predicted_category': 'lifestyle',
+                            'confidence': 0.0,
+                            'scores': {cat: 0.0 for cat in self.categories}
+                        })
+                        failed_classifications += 1
+                    else:
+                        try:
+                            result = self.classifier(text, self.categories)
+                            
+                            predicted_category = result['labels'][0]
+                            confidence = result['scores'][0]
+                            
+                            # Create scores dictionary
+                            scores = {}
+                            for label, score in zip(result['labels'], result['scores']):
+                                scores[label] = score
+                            
+                            results.append({
+                                'predicted_category': predicted_category,
+                                'confidence': confidence,
+                                'scores': scores
+                            })
+                            successful_classifications += 1
+                            
+                        except Exception as e:
+                            logger.warning(f"Classification failed for text: {e}")
+                            results.append({
+                                'predicted_category': 'lifestyle',
+                                'confidence': 0.0,
+                                'scores': {cat: 0.0 for cat in self.categories}
+                            })
+                            failed_classifications += 1
+                    
+                    # Update progress
+                    pbar.update(1)
+                    pbar.set_postfix({
+                        'successful': successful_classifications,
+                        'failed': failed_classifications,
+                        'success_rate': f"{successful_classifications/(successful_classifications+failed_classifications)*100:.1f}%" if (successful_classifications+failed_classifications) > 0 else "0%"
+                    })
+        
+        logger.info(f"✅ Classification complete: {successful_classifications} successful, {failed_classifications} failed")
+        return results
+    
+    def _rule_based_classification(self, texts: List[str]) -> List[Dict[str, any]]:
+        """Fallback rule-based classification."""
+        
+        category_keywords = {
+            'skincare': ['skin', 'skincare', 'serum', 'moisturizer', 'cleanser', 'spf', 'sunscreen', 
+                        'retinol', 'niacinamide', 'hyaluronic', 'vitamin c', 'acne', 'wrinkle'],
+            'makeup': ['makeup', 'foundation', 'concealer', 'mascara', 'lipstick', 'eyeshadow', 
+                      'blush', 'highlighter', 'contour', 'bronzer', 'primer'],
+            'hair': ['hair', 'shampoo', 'conditioner', 'styling', 'scalp', 'hair care', 'keratin'],
+            'fashion': ['fashion', 'style', 'outfit', 'clothing', 'dress', 'shoes', 'accessories'],
+            'lifestyle': ['lifestyle', 'life', 'daily', 'routine', 'wellness', 'health']
+        }
+        
+        results = []
+        
+        for text in texts:
+            if not isinstance(text, str):
+                text = str(text)
+            
+            text_lower = text.lower()
+            scores = {}
+            
+            for category, keywords in category_keywords.items():
+                score = sum(1 for keyword in keywords if keyword in text_lower)
+                scores[category] = score / len(keywords)  # Normalize
+            
+            if max(scores.values()) > 0:
+                predicted_category = max(scores, key=scores.get)
+                confidence = scores[predicted_category]
+            else:
+                predicted_category = 'lifestyle'
+                confidence = 0.1
+            
+            results.append({
+                'predicted_category': predicted_category,
+                'confidence': confidence,
+                'scores': scores
             })
         
-        try:
-            import tabulate
-            anomaly_df = pd.DataFrame(anomaly_data)
-            lines.append(anomaly_df.to_markdown(index=False))
-        except ImportError:
-            for item in anomaly_data:
-                lines.append(f"- **{item['Feature']}** (Score: {item['Score']}, {item['Frequency']})")
-    else:
-        lines.append("No anomalies detected.")
-    lines.append("")
-    
-    # Memory and Performance Insights
-    lines.append("## Memory and Performance Insights")
-    lines.append(f"- Memory-efficient streaming algorithms reduced peak usage by ~60%")
-    lines.append(f"- Parallel processing improved throughput by ~{min(4, psutil.cpu_count() or 1)}x")
-    lines.append(f"- Smart feature sampling maintained accuracy while reducing computation")
-    lines.append(f"- Caching system eliminated redundant calculations")
-    lines.append(f"- Early termination prevented memory exhaustion")
-    lines.append("")
-    
-    # Recommendations
-    lines.append("## Recommendations for Production")
-    lines.append("1. **Increase memory limits** for larger datasets (current: {}MB)".format(CONFIG['memory_limit_mb']))
-    lines.append("2. **Tune feature limits** based on available compute resources")
-    lines.append("3. **Monitor cache hit rates** to optimize caching strategy")
-    lines.append("4. **Consider distributed processing** for very large datasets")
-    lines.append("5. **Implement real-time streaming** for live anomaly detection")
-    lines.append("")
-    
-    # Write report
-    with open(report_path, 'w', encoding='utf-8') as f:
-        f.write("\n".join(lines))
-    
-    logger.info(f"Optimized model report generated: {report_path}")
+        return results
 
-# -----------------------------
-# Main Optimized Pipeline
-# -----------------------------
+class SentimentAnalyzer:
+    """Sentiment analysis using pre-trained models."""
+    
+    def __init__(self, model_name: str = 'cardiffnlp/twitter-roberta-base-sentiment'):
+        """
+        Initialize sentiment analyzer.
+        
+        Args:
+            model_name: Name of the sentiment analysis model
+        """
+        self.model_name = model_name
+        self.sentiment_pipeline = None
+        
+        if HAS_TRANSFORMERS:
+            try:
+                self.sentiment_pipeline = pipeline(
+                    "sentiment-analysis",
+                    model=model_name,
+                    tokenizer=model_name
+                )
+                logger.info(f"Loaded sentiment analysis model: {model_name}")
+            except Exception as e:
+                logger.warning(f"Failed to load sentiment model {model_name}, using default")
+                try:
+                    self.sentiment_pipeline = pipeline("sentiment-analysis")
+                    logger.info("Loaded default sentiment analysis model")
+                except Exception as e2:
+                    logger.error(f"Failed to load any sentiment model: {e2}")
+                    self.sentiment_pipeline = None
+        else:
+            logger.warning("Transformers not available, sentiment analysis disabled")
+    
+    def analyze_sentiment(self, texts: List[str]) -> List[Dict[str, any]]:
+        """
+        Analyze sentiment of texts.
+        
+        Args:
+            texts: List of text strings to analyze
+            
+        Returns:
+            List of sentiment analysis results
+        """
+        if not self.sentiment_pipeline:
+            return self._rule_based_sentiment(texts)
+        
+        results = []
+        
+        logger.info(f"😊 Analyzing sentiment for {len(texts)} texts")
+        
+        # Batch processing for better performance
+        batch_size = min(50, len(texts))  # Smaller batches for sentiment analysis
+        num_batches = (len(texts) // batch_size) + (1 if len(texts) % batch_size else 0)
+        
+        sentiment_stats = {'positive': 0, 'negative': 0, 'neutral': 0}
+        failed_analyses = 0
+        
+        with tqdm(total=len(texts), desc="Analyzing sentiment", unit="text") as pbar:
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, len(texts))
+                batch_texts = texts[start_idx:end_idx]
+                
+                # Process each text in the batch
+                for text in batch_texts:
+                    if not isinstance(text, str) or not text.strip():
+                        results.append({
+                            'sentiment': 'neutral',
+                            'confidence': 0.0,
+                            'score': 0.0
+                        })
+                        sentiment_stats['neutral'] += 1
+                    else:
+                        try:
+                            # Truncate text if too long
+                            text_truncated = text[:500]
+                            
+                            result = self.sentiment_pipeline(text_truncated)
+                            
+                            if isinstance(result, list):
+                                result = result[0]
+                            
+                            sentiment = result['label'].lower()
+                            confidence = result['score']
+                            
+                            # Convert to standardized sentiment labels
+                            if sentiment in ['positive', 'pos']:
+                                sentiment = 'positive'
+                                score = confidence
+                            elif sentiment in ['negative', 'neg']:
+                                sentiment = 'negative'
+                                score = -confidence
+                            else:
+                                sentiment = 'neutral'
+                                score = 0.0
+                            
+                            results.append({
+                                'sentiment': sentiment,
+                                'confidence': confidence,
+                                'score': score
+                            })
+                            
+                            sentiment_stats[sentiment] += 1
+                            
+                        except Exception as e:
+                            logger.warning(f"Sentiment analysis failed: {e}")
+                            results.append({
+                                'sentiment': 'neutral',
+                                'confidence': 0.0,
+                                'score': 0.0
+                            })
+                            failed_analyses += 1
+                    
+                    # Update progress
+                    pbar.update(1)
+                    total_processed = sum(sentiment_stats.values()) + failed_analyses
+                    if total_processed > 0:
+                        pbar.set_postfix({
+                            'pos': f"{sentiment_stats['positive']}/{total_processed}",
+                            'neg': f"{sentiment_stats['negative']}/{total_processed}",
+                            'neu': f"{sentiment_stats['neutral']}/{total_processed}",
+                            'failed': failed_analyses
+                        })
+        
+        total_analyzed = sum(sentiment_stats.values())
+        logger.info(f"✅ Sentiment analysis complete: {sentiment_stats['positive']} positive, {sentiment_stats['negative']} negative, {sentiment_stats['neutral']} neutral, {failed_analyses} failed")
+        return results
+    
+    def _rule_based_sentiment(self, texts: List[str]) -> List[Dict[str, any]]:
+        """Fallback rule-based sentiment analysis."""
+        
+        positive_words = {
+            'love', 'amazing', 'great', 'awesome', 'fantastic', 'excellent', 'perfect',
+            'beautiful', 'gorgeous', 'stunning', 'wonderful', 'incredible', 'best',
+            'favorite', 'obsessed', 'recommend', 'holy grail'
+        }
+        
+        negative_words = {
+            'hate', 'terrible', 'awful', 'horrible', 'worst', 'bad', 'disappointed',
+            'annoying', 'irritating', 'useless', 'waste', 'regret', 'broke out'
+        }
+        
+        results = []
+        
+        for text in texts:
+            if not isinstance(text, str):
+                text = str(text)
+            
+            text_lower = text.lower()
+            
+            positive_count = sum(1 for word in positive_words if word in text_lower)
+            negative_count = sum(1 for word in negative_words if word in text_lower)
+            
+            if positive_count > negative_count:
+                sentiment = 'positive'
+                confidence = min(positive_count / 10, 1.0)
+                score = confidence
+            elif negative_count > positive_count:
+                sentiment = 'negative'
+                confidence = min(negative_count / 10, 1.0)
+                score = -confidence
+            else:
+                sentiment = 'neutral'
+                confidence = 0.5
+                score = 0.0
+            
+            results.append({
+                'sentiment': sentiment,
+                'confidence': confidence,
+                'score': score
+            })
+        
+        return results
 
-def main_optimized_modeling():
-    """Main optimized modeling pipeline with performance monitoring."""
+class DecayDetector:
+    """Detect trend decay using time-series analysis."""
     
-    start_time = time.time()
-    start_memory = get_memory_usage()
+    def __init__(self, period_threshold: int = 3):
+        """
+        Initialize decay detector.
+        
+        Args:
+            period_threshold: Number of periods to analyze for decay
+        """
+        self.period_threshold = period_threshold
     
-    logger.info(f"Starting optimized modeling pipeline in {PERFORMANCE_MODE} mode")
-    logger.info(f"Initial memory usage: {start_memory:.1f} MB")
+    def calculate_derivatives(self, time_series: pd.Series) -> Tuple[pd.Series, pd.Series]:
+        """
+        Calculate first and second derivatives of time series.
+        
+        Args:
+            time_series: Time series data
+            
+        Returns:
+            Tuple of (first_derivative, second_derivative)
+        """
+        # First derivative (growth rate)
+        first_derivative = time_series.diff()
+        
+        # Second derivative (acceleration)
+        second_derivative = first_derivative.diff()
+        
+        return first_derivative, second_derivative
     
-    # Load processed features with optimization
-    logger.info("Loading processed feature datasets")
-    datasets = load_processed_features_optimized_wrapper()
+    def detect_decay(self, trend_data: pd.DataFrame, period_T: int = 3) -> pd.DataFrame:
+        """
+        Detect decay in confirmed trends.
+        
+        Args:
+            trend_data: DataFrame with trend data including time series
+            period_T: Period length for decay detection
+            
+        Returns:
+            DataFrame with decay detection results
+        """
+        if trend_data.empty:
+            return trend_data
+        
+        logger.info(f"Detecting decay in {len(trend_data)} trend records")
+        
+        # Ensure data is sorted by time
+        if 'timestamp' in trend_data.columns:
+            trend_data = trend_data.sort_values('timestamp')
+        elif 'time_bin' in trend_data.columns:
+            trend_data = trend_data.sort_values('time_bin')
+        
+        decay_results = []
+        
+        # Group by feature to analyze each trend separately
+        for feature, group in trend_data.groupby('feature'):
+            if len(group) < period_T + 1:
+                # Not enough data points
+                continue
+            
+            # Get engagement time series
+            if 'count' in group.columns:
+                engagement_series = group['count']
+            else:
+                continue
+            
+            # Calculate derivatives
+            growth_rate, acceleration = self.calculate_derivatives(engagement_series)
+            
+            # Check decay condition for the last period_T points
+            recent_growth = growth_rate.tail(period_T)
+            recent_acceleration = acceleration.tail(period_T)
+            
+            # Rule: if growth_rate > 0 and acceleration < 0 for period T
+            decay_condition = (
+                (recent_growth > 0).all() and 
+                (recent_acceleration < 0).all() and
+                len(recent_acceleration.dropna()) >= period_T - 1
+            )
+            
+            if decay_condition:
+                trend_state = "Decaying"
+                decay_confidence = min(1.0, abs(recent_acceleration.mean()) / max(recent_growth.mean(), 0.001))
+            else:
+                # Additional checks for other states
+                if (recent_growth > 0).all():
+                    if (recent_acceleration > 0).any():
+                        trend_state = "Accelerating"
+                    else:
+                        trend_state = "Growing"
+                elif (recent_growth < 0).all():
+                    trend_state = "Declining"
+                else:
+                    trend_state = "Stable"
+                
+                decay_confidence = 0.0
+            
+            # Calculate additional metrics
+            total_change = engagement_series.iloc[-1] - engagement_series.iloc[0] if len(engagement_series) > 1 else 0
+            avg_growth_rate = growth_rate.mean() if not growth_rate.empty else 0
+            avg_acceleration = acceleration.mean() if not acceleration.empty else 0
+            
+            decay_results.append({
+                'feature': feature,
+                'trend_state': trend_state,
+                'decay_confidence': decay_confidence,
+                'avg_growth_rate': avg_growth_rate,
+                'avg_acceleration': avg_acceleration,
+                'total_change': total_change,
+                'periods_analyzed': len(recent_growth),
+                'latest_growth': recent_growth.iloc[-1] if not recent_growth.empty else 0,
+                'latest_acceleration': recent_acceleration.iloc[-1] if not recent_acceleration.empty else 0
+            })
+        
+        # Create results DataFrame
+        decay_df = pd.DataFrame(decay_results)
+        
+        if not decay_df.empty:
+            # Merge with original data
+            trend_data_enhanced = trend_data.merge(
+                decay_df[['feature', 'trend_state', 'decay_confidence', 'avg_growth_rate', 'avg_acceleration']], 
+                on='feature', 
+                how='left'
+            )
+            
+            # Fill missing values
+            trend_data_enhanced['trend_state'] = trend_data_enhanced['trend_state'].fillna('Unknown')
+            trend_data_enhanced['decay_confidence'] = trend_data_enhanced['decay_confidence'].fillna(0.0)
+            
+            logger.info(f"Decay detection completed. Found {len(decay_df[decay_df['trend_state'] == 'Decaying'])} decaying trends")
+            
+            return trend_data_enhanced
+        else:
+            # Add empty columns if no results
+            trend_data['trend_state'] = 'Unknown'
+            trend_data['decay_confidence'] = 0.0
+            trend_data['avg_growth_rate'] = 0.0
+            trend_data['avg_acceleration'] = 0.0
+            
+            return trend_data
+
+class ModelingPipeline:
+    """Main modeling pipeline combining all components."""
     
-    if not datasets:
-        logger.error("No processed feature datasets found. Run Phase 2 first.")
-        return
+    def __init__(self):
+        """Initialize modeling pipeline."""
+        self.semantic_validator = SemanticValidator()
+        self.demographics_analyzer = DemographicsAnalyzer()
+        self.category_classifier = CategoryClassifier()
+        self.sentiment_analyzer = SentimentAnalyzer()
+        self.decay_detector = DecayDetector()
     
-    logger.info(f"Loaded {len(datasets)} datasets")
+    def run_semantic_validation(self, trend_data: pd.DataFrame) -> pd.DataFrame:
+        """Run semantic validation on trend data."""
+        logger.info("Running semantic validation")
+        return self.semantic_validator.find_semantic_trends(trend_data)
     
-    # Run optimized anomaly detection
-    logger.info("Starting optimized anomaly detection")
-    detection_results = run_parallel_anomaly_detection(datasets)
+    def run_demographic_analysis(self, user_bios: List[str]) -> pd.DataFrame:
+        """Run demographic analysis on user bios."""
+        logger.info("Running demographic analysis")
+        
+        demographics_results = self.demographics_analyzer.extract_age_indicators(user_bios)
+        
+        return pd.DataFrame(demographics_results)
     
-    # Analyze performance
-    performance_analysis = analyze_model_performance(detection_results['metrics'])
+    def run_category_classification(self, posts: List[str]) -> pd.DataFrame:
+        """Run category classification on posts."""
+        logger.info("Running category classification")
+        
+        classification_results = self.category_classifier.classify_posts(posts)
+        
+        return pd.DataFrame(classification_results)
     
-    # Generate comprehensive report
-    generate_optimized_model_report(detection_results, performance_analysis)
+    def run_sentiment_analysis(self, texts: List[str]) -> pd.DataFrame:
+        """Run sentiment analysis on texts."""
+        logger.info("Running sentiment analysis")
+        
+        sentiment_results = self.sentiment_analyzer.analyze_sentiment(texts)
+        
+        return pd.DataFrame(sentiment_results)
     
-    # Save detection results
-    results_path = MODELS_DIR / 'optimized_anomaly_results.pkl'
-    try:
-        with open(results_path, 'wb') as f:
-            pickle.dump(detection_results, f)
-        logger.info(f"Results saved to {results_path}")
-    except Exception as e:
-        logger.error(f"Failed to save results: {e}")
+    def run_decay_detection(self, trend_data: pd.DataFrame) -> pd.DataFrame:
+        """Run decay detection on trend data."""
+        logger.info("Running decay detection")
+        return self.decay_detector.detect_decay(trend_data)
     
-    # Performance summary
-    end_time = time.time()
-    end_memory = get_memory_usage()
-    total_duration = end_time - start_time
+    def run_full_pipeline(self, data_sources: Dict[str, any]) -> Dict[str, any]:
+        """
+        Run the complete modeling pipeline.
+        
+        Args:
+            data_sources: Dictionary containing various data sources
+            
+        Returns:
+            Dictionary containing all modeling results
+        """
+        logger.info("Starting full modeling pipeline")
+        
+        results = {
+            'semantic_validation': None,
+            'demographics': None,
+            'category_classification': None,
+            'sentiment_analysis': None,
+            'decay_detection': None
+        }
+        
+        # Semantic validation on trend candidates
+        if 'trend_candidates' in data_sources and data_sources['trend_candidates'] is not None:
+            trend_data = data_sources['trend_candidates']
+            if not trend_data.empty:
+                results['semantic_validation'] = self.run_semantic_validation(trend_data)
+                results['decay_detection'] = self.run_decay_detection(trend_data)
+        
+        # Demographic analysis on user bios
+        if 'user_bios' in data_sources:
+            user_bios = data_sources['user_bios']
+            if user_bios:
+                results['demographics'] = self.run_demographic_analysis(user_bios)
+        
+        # Category classification on posts
+        if 'posts' in data_sources:
+            posts = data_sources['posts']
+            if posts:
+                results['category_classification'] = self.run_category_classification(posts)
+        
+        # Sentiment analysis on text data
+        if 'texts' in data_sources:
+            texts = data_sources['texts']
+            if texts:
+                results['sentiment_analysis'] = self.run_sentiment_analysis(texts)
+        
+        # Save results
+        self.save_results(results)
+        
+        logger.info("Modeling pipeline completed successfully")
+        return results
     
-    logger.info("Optimized modeling pipeline completed!")
-    logger.info(f"Total execution time: {total_duration:.2f} seconds")
-    logger.info(f"Memory usage: {start_memory:.1f} MB → {end_memory:.1f} MB")
-    logger.info(f"Anomalies detected: {len(detection_results.get('combined_anomalies', []))}")
+    def save_results(self, results: Dict) -> None:
+        """Save modeling results to files."""
+        
+        for result_name, df in results.items():
+            if df is not None and not df.empty:
+                # Convert any list columns to strings for parquet compatibility
+                df_copy = df.copy()
+                for col in df_copy.columns:
+                    if df_copy[col].dtype == 'object':
+                        # Check if column contains lists
+                        sample_val = df_copy[col].dropna().iloc[0] if not df_copy[col].dropna().empty else None
+                        if isinstance(sample_val, list):
+                            df_copy[col] = df_copy[col].apply(lambda x: str(x) if x is not None else None)
+                
+                filepath = INTERIM_DIR / f"modeling_{result_name}.parquet"
+                df_copy.to_parquet(filepath, index=False)
+                logger.info(f"Saved {result_name} results to {filepath}")
+        
+        # Save summary
+        summary = {
+            'timestamp': datetime.now().isoformat(),
+            'results_generated': [k for k, v in results.items() if v is not None and not v.empty],
+            'total_records': {k: len(v) if v is not None else 0 for k, v in results.items()}
+        }
+        
+        with open(INTERIM_DIR / 'modeling_summary.json', 'w') as f:
+            json.dump(summary, f, indent=2)
+
+def main():
+    """Main function to run the modeling pipeline."""
     
-    # Save performance summary
-    summary = {
-        'execution_time_seconds': total_duration,
-        'memory_start_mb': start_memory,
-        'memory_end_mb': end_memory,
-        'memory_peak_mb': performance_analysis.get('peak_memory_usage', end_memory),
-        'total_anomalies': len(detection_results.get('combined_anomalies', [])),
-        'performance_mode': PERFORMANCE_MODE,
-        'datasets_processed': len(datasets),
-        'parallel_enabled': CONFIG['enable_parallel'],
-        'timestamp': datetime.now().isoformat()
+    logger.info("L'Oréal Datathon 2025 - Modeling Pipeline")
+    
+    # Example usage with sample data
+    sample_data = {
+        'trend_candidates': pd.DataFrame({
+            'feature': ['skincare', 'makeup', 'niacinamide', 'retinol', 'contour'],
+            'count': [100, 80, 120, 90, 60],
+            'rate_of_change': [0.15, 0.10, 0.25, 0.08, -0.05],
+            'timestamp': pd.date_range('2025-01-01', periods=5, freq='6H')
+        }),
+        'user_bios': [
+            "22yo beauty enthusiast and Gen Z makeup lover",
+            "College student passionate about skincare",
+            "Millennial mom sharing beauty tips",
+            "Teen interested in fashion trends"
+        ],
+        'posts': [
+            "Love this new skincare routine with niacinamide!",
+            "Best makeup tutorial for beginners",
+            "Hair care tips for damaged hair",
+            "Fashion haul from my favorite brands"
+        ],
+        'texts': [
+            "This product is amazing! Highly recommend",
+            "Not impressed with this purchase, waste of money",
+            "Good value for the price, will buy again",
+            "Absolutely love the results!"
+        ]
     }
     
-    summary_path = INTERIM_DIR / 'modeling_performance_summary.json'
-    with open(summary_path, 'w') as f:
-        json.dump(summary, f, indent=2)
+    # Initialize modeling pipeline
+    pipeline = ModelingPipeline()
     
-    logger.info(f"Performance summary saved to {summary_path}")
+    # Run pipeline
+    results = pipeline.run_full_pipeline(sample_data)
+    
+    # Print summary
+    print("\n" + "="*60)
+    print("MODELING PIPELINE SUMMARY")
+    print("="*60)
+    
+    for result_name, df in results.items():
+        if df is not None and not df.empty:
+            print(f"{result_name.upper()}: {len(df)} records")
+            if result_name == 'semantic_validation' and 'semantic_cluster' in df.columns:
+                clusters = df['semantic_cluster'].nunique()
+                print(f"  Semantic clusters: {clusters}")
+            elif result_name == 'demographics' and 'age_group' in df.columns:
+                age_groups = df['age_group'].value_counts()
+                print(f"  Age groups: {dict(age_groups)}")
+            elif result_name == 'sentiment_analysis' and 'sentiment' in df.columns:
+                sentiments = df['sentiment'].value_counts()
+                print(f"  Sentiments: {dict(sentiments)}")
+            elif result_name == 'decay_detection' and 'trend_state' in df.columns:
+                states = df['trend_state'].value_counts()
+                print(f"  Trend states: {dict(states)}")
+        else:
+            print(f"{result_name.upper()}: No data")
+    
+    print("="*60)
 
-if __name__ == '__main__':
-    main_optimized_modeling()
+if __name__ == "__main__":
+    main()
