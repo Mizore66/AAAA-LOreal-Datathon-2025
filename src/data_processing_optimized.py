@@ -10,14 +10,16 @@ import re
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Union
+from typing import List, Dict, Optional, Tuple, Union, Generator
 import logging
 from datetime import datetime, timedelta
 import emoji
 from tqdm import tqdm
-import librosa
 import json
 import warnings
+from multiprocessing import Pool, cpu_count
+from functools import partial
+import gc
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
@@ -25,6 +27,14 @@ warnings.filterwarnings('ignore')
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Try to import librosa for audio processing
+try:
+    import librosa
+    LIBROSA_AVAILABLE = True
+except ImportError:
+    LIBROSA_AVAILABLE = False
+    logger.warning("librosa not available - audio processing will be disabled")
 
 # Define paths
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,14 +46,19 @@ INTERIM_DIR = ROOT / "data" / "interim"
 for dir_path in [RAW_DIR, PROC_DIR, INTERIM_DIR]:
     dir_path.mkdir(parents=True, exist_ok=True)
 
-# Text cleaning patterns
+# Configuration for large-scale processing
+CHUNK_SIZE = 50000  # Process data in chunks of 50K rows
+MAX_WORKERS = min(cpu_count(), 8)  # Limit CPU usage
+MEMORY_LIMIT_MB = 2000  # Memory limit per chunk in MB
+
+# Text cleaning patterns (pre-compiled for performance)
 URL_PATTERN = re.compile(r'https?://\S+|www\.\S+', re.IGNORECASE)
 MENTION_PATTERN = re.compile(r'@\w+', re.IGNORECASE)
 SPECIAL_CHARS_PATTERN = re.compile(r'[^\w\s#]', re.UNICODE)
 HASHTAG_PATTERN = re.compile(r'#(\w+)')
 WHITESPACE_PATTERN = re.compile(r'\s+')
 
-# Define relevant categories for beauty/fashion/skincare
+# Fast keyword lookup sets for early filtering
 BEAUTY_KEYWORDS = {
     'skincare': ['skincare', 'skin care', 'serum', 'moisturizer', 'cleanser', 'toner', 
                  'sunscreen', 'spf', 'retinol', 'niacinamide', 'hyaluronic acid', 
@@ -60,6 +75,11 @@ BEAUTY_KEYWORDS = {
              'scalp care', 'hair growth', 'keratin', 'heat protectant']
 }
 
+# Fast keyword lookup set for early filtering
+BEAUTY_FAST_KEYWORDS = set()
+for keywords in BEAUTY_KEYWORDS.values():
+    BEAUTY_FAST_KEYWORDS.update(keywords)
+
 # Define stop words for text processing
 STOP_WORDS = {
     'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with',
@@ -75,8 +95,8 @@ STOP_WORDS = {
     'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very'
 }
 
-class TextCleaner:
-    """Text data cleaning for hashtags, comments, and captions."""
+class VectorizedTextCleaner:
+    """Optimized text data cleaning using vectorized operations for large datasets."""
     
     def __init__(self, handle_emojis: str = 'remove'):
         """
@@ -87,113 +107,141 @@ class TextCleaner:
         """
         self.handle_emojis = handle_emojis
         
-    def clean_text(self, text: str) -> str:
+    def fast_relevance_filter(self, text_series: pd.Series) -> pd.Series:
         """
-        Clean text by removing URLs, mentions, special characters and handling emojis.
+        Fast pre-filter to identify potentially relevant texts using simple string contains.
+        This avoids expensive processing on clearly irrelevant content.
         
         Args:
-            text: Input text to clean
+            text_series: Pandas Series of text data
             
         Returns:
-            Cleaned text
+            Boolean series indicating relevance
         """
-        if not isinstance(text, str) or not text.strip():
-            return ""
+        # Convert to lowercase for case-insensitive matching
+        text_lower = text_series.str.lower()
+        
+        # Check if any beauty keyword appears in the text
+        relevant_mask = pd.Series(False, index=text_series.index)
+        
+        # Use vectorized string contains for fast filtering
+        for keyword in BEAUTY_FAST_KEYWORDS:
+            relevant_mask |= text_lower.str.contains(keyword, na=False, regex=False)
+        
+        return relevant_mask
+    
+    def clean_text_vectorized(self, text_series: pd.Series) -> pd.Series:
+        """
+        Vectorized text cleaning for better performance on large datasets.
+        
+        Args:
+            text_series: Pandas Series of text data
+            
+        Returns:
+            Series of cleaned text
+        """
+        if text_series.empty:
+            return text_series
+        
+        # Handle null values
+        cleaned = text_series.fillna('').astype(str)
         
         # Convert to lowercase
-        text = text.lower()
+        cleaned = cleaned.str.lower()
         
-        # Handle emojis
-        if self.handle_emojis == 'convert':
-            # Convert emojis to text description
-            text = emoji.demojize(text, delimiters=(" ", " "))
-        else:
-            # Remove emojis
-            text = emoji.replace_emoji(text, replace='')
+        # Handle emojis (if needed)
+        if self.handle_emojis == 'remove':
+            # Vectorized emoji removal using regex
+            emoji_pattern = re.compile(
+                r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF'
+                r'\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U000024C2-\U0001F251]+',
+                flags=re.UNICODE
+            )
+            cleaned = cleaned.str.replace(emoji_pattern, ' ', regex=True)
         
         # Remove URLs
-        text = URL_PATTERN.sub(' ', text)
+        cleaned = cleaned.str.replace(URL_PATTERN, ' ', regex=True)
         
         # Remove user mentions
-        text = MENTION_PATTERN.sub(' ', text)
+        cleaned = cleaned.str.replace(MENTION_PATTERN, ' ', regex=True)
         
         # Remove special characters (except hashtags)
-        text = SPECIAL_CHARS_PATTERN.sub(' ', text)
+        cleaned = cleaned.str.replace(SPECIAL_CHARS_PATTERN, ' ', regex=True)
         
         # Normalize whitespace
-        text = WHITESPACE_PATTERN.sub(' ', text).strip()
+        cleaned = cleaned.str.replace(WHITESPACE_PATTERN, ' ', regex=True).str.strip()
         
-        return text
+        return cleaned
     
-    def extract_hashtags(self, text: str) -> List[str]:
-        """Extract hashtags from text."""
-        if not isinstance(text, str):
-            return []
-        return [match.group(1).lower() for match in HASHTAG_PATTERN.finditer(text)]
+    def extract_hashtags_vectorized(self, text_series: pd.Series) -> pd.Series:
+        """Vectorized hashtag extraction."""
+        if text_series.empty:
+            return pd.Series(dtype=object)
+        
+        # Use str.findall to extract hashtags
+        hashtags = text_series.str.findall(r'#(\w+)')
+        
+        # Convert to lowercase
+        return hashtags.apply(lambda x: [tag.lower() for tag in x] if x else [])
     
-    def tokenize_and_filter(self, text: str) -> List[str]:
+    def tokenize_and_filter_vectorized(self, text_series: pd.Series) -> pd.Series:
         """
-        Tokenize text and remove stop words.
+        Vectorized tokenization and stop word removal.
         
         Args:
-            text: Input text to tokenize
+            text_series: Series of cleaned text
             
         Returns:
-            List of tokens without stop words
+            Series of token lists
         """
-        if not isinstance(text, str):
-            return []
+        if text_series.empty:
+            return pd.Series(dtype=object)
         
         # Split into tokens
-        tokens = text.split()
+        tokens = text_series.str.split()
         
         # Filter out stop words and short tokens
-        filtered_tokens = [
-            token for token in tokens 
-            if len(token) > 2 and token not in STOP_WORDS
-        ]
+        filtered = tokens.apply(
+            lambda x: [token for token in (x or []) 
+                      if len(token) > 2 and token not in STOP_WORDS]
+        )
         
-        return filtered_tokens
+        return filtered
 
-class CategoryClassifier:
-    """Categorize data into Beauty/Fashion/Skincare sections."""
+class OptimizedCategoryClassifier:
+    """Optimized category classification with vectorized operations."""
     
     def __init__(self):
-        # Compile patterns for faster matching
+        # Pre-compile patterns for faster matching
         self.category_patterns = {}
         for category, keywords in BEAUTY_KEYWORDS.items():
             pattern = '|'.join(re.escape(keyword) for keyword in keywords)
             self.category_patterns[category] = re.compile(pattern, re.IGNORECASE)
     
-    def classify_text(self, text: str) -> Optional[str]:
+    def classify_text_vectorized(self, text_series: pd.Series) -> pd.Series:
         """
-        Classify text into one of the beauty/fashion categories.
+        Vectorized text classification.
         
         Args:
-            text: Text to classify
+            text_series: Series of text to classify
             
         Returns:
-            Category name or None if not relevant
+            Series of category labels
         """
-        if not isinstance(text, str):
-            return None
+        if text_series.empty:
+            return pd.Series(dtype=object)
         
-        # Count matches for each category
-        category_scores = {}
+        # Initialize with None
+        categories = pd.Series(None, index=text_series.index)
+        
+        # Check each category pattern (patterns are already compiled with case insensitive flag)
         for category, pattern in self.category_patterns.items():
-            matches = len(pattern.findall(text))
-            if matches > 0:
-                category_scores[category] = matches
+            mask = text_series.str.contains(pattern, na=False, regex=True)
+            # Only assign category if not already assigned (first match wins)
+            categories = categories.where(categories.notna(), 
+                                        categories.where(~mask, category))
         
-        if not category_scores:
-            return None
-        
-        # Return category with highest score
-        return max(category_scores.items(), key=lambda x: x[1])[0]
-    
-    def is_relevant(self, text: str) -> bool:
-        """Check if text is relevant to beauty/fashion/skincare."""
-        return self.classify_text(text) is not None
+        return categories
 
 class AudioProcessor:
     """Audio data processing using librosa."""
@@ -219,6 +267,10 @@ class AudioProcessor:
         Returns:
             Dictionary containing extracted features
         """
+        if not LIBROSA_AVAILABLE:
+            logger.warning("librosa not available - skipping audio processing")
+            return {}
+            
         try:
             # Load audio file
             y, sr = librosa.load(audio_path, sr=self.sample_rate)
@@ -423,7 +475,7 @@ class DatasetPreprocessor:
     """Dataset-specific preprocessing for comments and videos."""
     
     def __init__(self):
-        self.text_cleaner = TextCleaner(handle_emojis='remove')
+        self.text_cleaner = VectorizedTextCleaner(handle_emojis='remove')
         
     def detect_dataset_type(self, df: pd.DataFrame) -> Optional[str]:
         """
@@ -620,21 +672,170 @@ class DatasetPreprocessor:
             logger.warning(f"Unable to determine dataset type for dataframe with columns: {list(df.columns)}")
             return None
 
-class DataProcessor:
-    """Main data processing pipeline."""
+class OptimizedDataProcessor:
+    """Optimized main data processing pipeline for large-scale data."""
     
     def __init__(self):
-        self.text_cleaner = TextCleaner(handle_emojis='remove')
-        self.category_classifier = CategoryClassifier()
+        self.text_cleaner = VectorizedTextCleaner(handle_emojis='remove')
+        self.category_classifier = OptimizedCategoryClassifier()
         self.audio_processor = AudioProcessor()
         self.time_engineer = TimeSeriesEngineer()
         self.trend_table = TrendCandidateTable()
         self.preprocessor = DatasetPreprocessor()
+        
+    def chunked_reader(self, filepath: Union[str, Path], chunk_size: int = CHUNK_SIZE) -> Generator[pd.DataFrame, None, None]:
+        """
+        Read large parquet files in chunks to manage memory usage.
+        
+        Args:
+            filepath: Path to parquet file
+            chunk_size: Number of rows per chunk
+            
+        Yields:
+            DataFrame chunks
+        """
+        try:
+            # For parquet files, we need to use pyarrow for chunked reading
+            import pyarrow.parquet as pq
+            
+            parquet_file = pq.ParquetFile(filepath)
+            
+            # Read in batches
+            for batch in parquet_file.iter_batches(batch_size=chunk_size):
+                df_chunk = batch.to_pandas()
+                yield df_chunk
+                
+        except Exception as e:
+            logger.warning(f"Could not read {filepath} in chunks: {e}. Loading full file.")
+            # Fallback to reading entire file
+            df = pd.read_parquet(filepath)
+            
+            # Split into chunks manually
+            for start in range(0, len(df), chunk_size):
+                end = min(start + chunk_size, len(df))
+                yield df.iloc[start:end].copy()
+    
+    def process_text_chunk(self, chunk: pd.DataFrame) -> pd.DataFrame:
+        """
+        Process a single chunk of text data with optimized operations.
+        
+        Args:
+            chunk: DataFrame chunk to process
+            
+        Returns:
+            Processed chunk
+        """
+        if chunk.empty:
+            return pd.DataFrame()
+        
+        # Apply dataset-specific preprocessing to standardize the data
+        chunk_preprocessed = self.preprocessor.preprocess_dataset(chunk)
+        
+        if chunk_preprocessed is None or chunk_preprocessed.empty:
+            return pd.DataFrame()
+        
+        # Early filtering for relevance using fast string operations
+        relevant_mask = self.text_cleaner.fast_relevance_filter(chunk_preprocessed['text'])
+        
+        if not relevant_mask.any():
+            logger.debug(f"No relevant content found in chunk of {len(chunk)} rows")
+            return pd.DataFrame()
+        
+        # Filter to relevant rows only
+        chunk_relevant = chunk_preprocessed[relevant_mask].copy()
+        logger.debug(f"Filtered chunk from {len(chunk)} to {len(chunk_relevant)} relevant rows")
+        
+        # Vectorized text processing
+        chunk_relevant['cleaned_text'] = self.text_cleaner.clean_text_vectorized(chunk_relevant['text'])
+        chunk_relevant['hashtags'] = self.text_cleaner.extract_hashtags_vectorized(chunk_relevant['text'])
+        chunk_relevant['tokens'] = self.text_cleaner.tokenize_and_filter_vectorized(chunk_relevant['cleaned_text'])
+        
+        # Vectorized category classification
+        chunk_relevant['category'] = self.category_classifier.classify_text_vectorized(chunk_relevant['cleaned_text'])
+        
+        # Final filter - only keep rows with assigned categories
+        final_mask = chunk_relevant['category'].notna()
+        chunk_final = chunk_relevant[final_mask].copy()
+        
+        # Memory cleanup
+        del chunk_preprocessed, chunk_relevant
+        gc.collect()
+        
+        return chunk_final
+    
+    def process_text_data_chunked(self, df: pd.DataFrame = None, filepath: Union[str, Path] = None) -> pd.DataFrame:
+        """
+        Process large text data using chunked processing for memory efficiency.
+        
+        Args:
+            df: Input dataframe (for small datasets)
+            filepath: Path to parquet file (for large datasets)
+            
+        Returns:
+            Processed dataframe with cleaned text and categories
+        """
+        if filepath:
+            logger.info(f"Processing large text data from file: {filepath}")
+            chunks_processed = []
+            total_input_rows = 0
+            total_output_rows = 0
+            
+            # Process file in chunks
+            for i, chunk in enumerate(self.chunked_reader(filepath)):
+                total_input_rows += len(chunk)
+                logger.info(f"Processing chunk {i+1}: {len(chunk):,} rows")
+                
+                processed_chunk = self.process_text_chunk(chunk)
+                
+                if not processed_chunk.empty:
+                    chunks_processed.append(processed_chunk)
+                    total_output_rows += len(processed_chunk)
+                
+                # Log progress every 10 chunks
+                if (i + 1) % 10 == 0:
+                    relevance_rate = (total_output_rows / total_input_rows * 100) if total_input_rows > 0 else 0
+                    logger.info(f"Processed {i+1} chunks: {total_input_rows:,} → {total_output_rows:,} ({relevance_rate:.1f}% relevant)")
+            
+            if chunks_processed:
+                final_df = pd.concat(chunks_processed, ignore_index=True)
+                logger.info(f"Chunked processing complete: {total_input_rows:,} → {len(final_df):,} rows ({len(final_df)/total_input_rows*100:.1f}% relevant)")
+                return final_df
+            else:
+                logger.warning("No relevant data found in file")
+                return pd.DataFrame()
+                
+        elif df is not None:
+            logger.info(f"Processing {len(df):,} text records in memory")
+            
+            # For smaller datasets, we can still use chunking for consistency
+            if len(df) > CHUNK_SIZE:
+                chunks_processed = []
+                for start in range(0, len(df), CHUNK_SIZE):
+                    end = min(start + CHUNK_SIZE, len(df))
+                    chunk = df.iloc[start:end].copy()
+                    
+                    processed_chunk = self.process_text_chunk(chunk)
+                    if not processed_chunk.empty:
+                        chunks_processed.append(processed_chunk)
+                
+                if chunks_processed:
+                    return pd.concat(chunks_processed, ignore_index=True)
+                else:
+                    return pd.DataFrame()
+            else:
+                # Small enough to process as single chunk
+                return self.process_text_chunk(df)
+        
+        else:
+            raise ValueError("Either df or filepath must be provided")
+
+class DataProcessor(OptimizedDataProcessor):
+    """Backward compatibility wrapper for the optimized processor."""
     
     def process_text_data(self, df: pd.DataFrame, text_col: str = None, 
                          timestamp_col: str = None) -> pd.DataFrame:
         """
-        Process text data (comments, videos, etc.) through the full pipeline.
+        Legacy method for backward compatibility.
         
         Args:
             df: Input dataframe (raw from parquet file)
@@ -644,37 +845,7 @@ class DataProcessor:
         Returns:
             Processed dataframe with cleaned text and categories
         """
-        logger.info(f"Processing {len(df)} text records")
-        
-        # First, apply dataset-specific preprocessing to standardize the data
-        df_preprocessed = self.preprocessor.preprocess_dataset(df)
-        
-        if df_preprocessed is None:
-            logger.warning("Dataset preprocessing failed - returning empty DataFrame")
-            return pd.DataFrame()
-        
-        # Now continue with standard text processing on the standardized 'text' column
-        df_processed = df_preprocessed.copy()
-        
-        # Clean text
-        df_processed['cleaned_text'] = df_processed['text'].apply(self.text_cleaner.clean_text)
-        
-        # Extract hashtags from original text (before cleaning)
-        df_processed['hashtags'] = df_processed['text'].apply(self.text_cleaner.extract_hashtags)
-        
-        # Tokenize and filter
-        df_processed['tokens'] = df_processed['cleaned_text'].apply(self.text_cleaner.tokenize_and_filter)
-        
-        # Classify categories
-        df_processed['category'] = df_processed['cleaned_text'].apply(self.category_classifier.classify_text)
-        
-        # Filter out irrelevant data
-        relevant_mask = df_processed['category'].notna()
-        df_filtered = df_processed[relevant_mask].copy()
-        
-        logger.info(f"Filtered to {len(df_filtered)} relevant records ({len(df_filtered)/len(df)*100:.1f}%)")
-        
-        return df_filtered
+        return self.process_text_data_chunked(df=df)
     
     def process_audio_data(self, audio_files: List[Union[str, Path]]) -> pd.DataFrame:
         """
@@ -759,17 +930,17 @@ class DataProcessor:
         
         return results
     
-    def run_full_pipeline(self, data_sources: Dict[str, pd.DataFrame]) -> Dict[str, any]:
+    def run_full_pipeline(self, data_sources: Union[Dict[str, pd.DataFrame], Dict[str, str]]) -> Dict[str, any]:
         """
-        Run the complete data processing pipeline.
+        Run the complete data processing pipeline with optimization for large datasets.
         
         Args:
-            data_sources: Dictionary of data sources (parquet DataFrames with raw schema)
+            data_sources: Dictionary of data sources (DataFrames or file paths)
             
         Returns:
             Dictionary containing all processed results
         """
-        logger.info("Starting full data processing pipeline")
+        logger.info("Starting optimized data processing pipeline for large-scale data")
         
         results = {
             'processed_text': {},
@@ -778,35 +949,47 @@ class DataProcessor:
             'trend_candidates': None
         }
         
-        # Process text data sources - now each DataFrame can be comments or videos
-        for source_name, df in data_sources.items():
-            if not df.empty:
-                logger.info(f"Processing data from {source_name}")
+        # Process text data sources
+        for source_name, source in data_sources.items():
+            if source_name == 'audio_files':
+                continue  # Handle audio separately
                 
-                # Use the new preprocessing approach that auto-detects dataset type
-                processed_text = self.process_text_data(df)
+            logger.info(f"Processing data from {source_name}")
+            
+            # Determine if source is DataFrame or file path
+            if isinstance(source, (str, Path)):
+                # Process large file using chunked reading
+                processed_text = self.process_text_data_chunked(filepath=source)
+            elif isinstance(source, pd.DataFrame) and not source.empty:
+                # Process DataFrame in memory (with chunking if large)
+                processed_text = self.process_text_data_chunked(df=source)
+            else:
+                logger.warning(f"Skipping invalid source: {source_name}")
+                continue
+            
+            if not processed_text.empty:
+                results['processed_text'][source_name] = processed_text
                 
-                if not processed_text.empty:
-                    results['processed_text'][source_name] = processed_text
+                # Optimized time series processing
+                logger.info(f"Creating time series features for {source_name}")
+                
+                # Process hashtags in batches to avoid memory issues
+                if 'hashtags' in processed_text.columns:
+                    hashtag_ts = self._create_optimized_time_series(
+                        processed_text, 'hashtags', source_name + '_hashtags'
+                    )
+                    if hashtag_ts:
+                        results['time_series'][f'{source_name}_hashtags'] = hashtag_ts
+                
+                # Process tokens in batches
+                token_ts = self._create_optimized_time_series(
+                    processed_text, 'tokens', source_name + '_keywords'
+                )
+                if token_ts:
+                    results['time_series'][f'{source_name}_keywords'] = token_ts
                     
-                    # Create time series for hashtags
-                    if 'hashtags' in processed_text.columns:
-                        hashtag_df = processed_text.explode('hashtags').dropna(subset=['hashtags'])
-                        if not hashtag_df.empty:
-                            hashtag_ts = self.create_time_series_features(
-                                hashtag_df, 'hashtags', 'timestamp', ['1h', '6h']
-                            )
-                            results['time_series'][f'{source_name}_hashtags'] = hashtag_ts
-                    
-                    # Create time series for keywords/tokens
-                    token_df = processed_text.explode('tokens').dropna(subset=['tokens'])
-                    if not token_df.empty:
-                        keyword_ts = self.create_time_series_features(
-                            token_df, 'tokens', 'timestamp', ['1h', '6h']
-                        )
-                        results['time_series'][f'{source_name}_keywords'] = keyword_ts
-                else:
-                    logger.warning(f"No relevant data found in {source_name}")
+            else:
+                logger.warning(f"No relevant data found in {source_name}")
         
         # Process audio data if available
         if 'audio_files' in data_sources:
@@ -820,40 +1003,197 @@ class DataProcessor:
         # Save results
         self.save_results(results)
         
-        logger.info("Data processing pipeline completed successfully")
+        logger.info("Optimized data processing pipeline completed successfully")
         return results
     
+    def _create_optimized_time_series(self, df: pd.DataFrame, feature_col: str, name: str) -> Dict[str, pd.DataFrame]:
+        """
+        Create time series features in an optimized way for large datasets.
+        
+        Args:
+            df: Input dataframe
+            feature_col: Column containing features (lists)
+            name: Name for logging
+            
+        Returns:
+            Dictionary of time series DataFrames
+        """
+        try:
+            # Check if we have the required columns
+            if feature_col not in df.columns or 'timestamp' not in df.columns:
+                logger.warning(f"Missing columns for time series: {feature_col} or timestamp")
+                return {}
+            
+            # Process in chunks to avoid memory issues with explode
+            chunk_size = 10000  # Smaller chunks for explode operations
+            all_chunks = []
+            
+            for start in range(0, len(df), chunk_size):
+                end = min(start + chunk_size, len(df))
+                chunk = df.iloc[start:end].copy()
+                
+                # Explode the feature column
+                exploded_chunk = chunk.explode(feature_col).dropna(subset=[feature_col])
+                if not exploded_chunk.empty:
+                    all_chunks.append(exploded_chunk)
+            
+            if not all_chunks:
+                return {}
+            
+            # Combine chunks
+            exploded_df = pd.concat(all_chunks, ignore_index=True)
+            logger.info(f"Exploded {name}: {len(df):,} → {len(exploded_df):,} rows")
+            
+            # Create time series for different intervals
+            intervals = ['1h', '6h']  # Reduced intervals for performance
+            results = {}
+            
+            for interval in intervals:
+                logger.debug(f"Creating {interval} time series for {name}")
+                aggregated = self.time_engineer.aggregate_features(
+                    exploded_df, feature_col, 'timestamp', interval
+                )
+                results[interval] = aggregated
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error creating time series for {name}: {e}")
+            return {}
+
     def save_results(self, results: Dict) -> None:
-        """Save processing results to files."""
+        """Save processing results to files with optimization for large datasets."""
         
         # Save processed text data
         for source_name, df in results['processed_text'].items():
             filepath = PROC_DIR / f"processed_text_{source_name}.parquet"
-            df.to_parquet(filepath, index=False)
-            logger.info(f"Saved processed text data to {filepath}")
+            # Use compression for large files
+            df.to_parquet(filepath, index=False, compression='snappy')
+            logger.info(f"Saved processed text data to {filepath} ({len(df):,} rows)")
         
         # Save audio features
         if results['audio_features'] is not None and not results['audio_features'].empty:
             filepath = PROC_DIR / "audio_features.parquet"
-            results['audio_features'].to_parquet(filepath, index=False)
+            results['audio_features'].to_parquet(filepath, index=False, compression='snappy')
             logger.info(f"Saved audio features to {filepath}")
         
         # Save time series data
         for source_name, intervals in results['time_series'].items():
             for interval, df in intervals.items():
                 filepath = PROC_DIR / f"timeseries_{source_name}_{interval}.parquet"
-                df.to_parquet(filepath, index=False)
+                df.to_parquet(filepath, index=False, compression='snappy')
                 logger.info(f"Saved time series data to {filepath}")
         
         # Save trend candidate table
         if results['trend_candidates'] is not None and not results['trend_candidates'].empty:
             self.trend_table.save_trend_table(PROC_DIR / "trend_candidates.parquet")
 
+def create_large_test_dataset(num_rows: int = 100000) -> pd.DataFrame:
+    """
+    Create a large test dataset for performance testing.
+    
+    Args:
+        num_rows: Number of rows to generate
+        
+    Returns:
+        Large test DataFrame
+    """
+    logger.info(f"Creating test dataset with {num_rows:,} rows")
+    
+    import random
+    
+    # Beauty/fashion content templates
+    content_templates = [
+        "Love this #{} routine! #{} #beauty",
+        "Best #{} tutorial ever! #{} #{}",
+        "This #{} {} is amazing! #{}",
+        "Get ready with me! #{} #{} #grwm",
+        "#{} of the day! #{} #fashion",
+        "My #{} essentials! #{} #selfcare",
+        "#{} transformation! #{} #beforeafter",
+        "New #{} haul! #{} #shopping",
+        "#{} tips and tricks! #{} #beauty",
+        "Daily #{} routine! #{} #skincare"
+    ]
+    
+    # Keywords for filling templates
+    beauty_words = list(BEAUTY_FAST_KEYWORDS)
+    hashtags = ['glowup', 'selfcare', 'beauty', 'makeup', 'skincare', 'fashion', 'style', 'routine']
+    
+    # Generate data
+    data = []
+    for i in range(num_rows):
+        template = random.choice(content_templates)
+        words = random.choices(beauty_words, k=3)
+        tags = random.choices(hashtags, k=2)
+        
+        text = template.format(*words, *tags)
+        
+        # Add some irrelevant content (should be filtered out)
+        if i % 10 == 0:
+            text = f"Random content about cooking and sports {i}"
+        
+        data.append({
+            'commentId': f'c{i}',
+            'textOriginal': text,
+            'likeCount': random.randint(0, 1000),
+            'publishedAt': pd.Timestamp('2025-01-01') + pd.Timedelta(hours=i % 24),
+            'videoId': f'v{i % 1000}',
+            'authorId': f'a{i % 10000}'
+        })
+    
+    return pd.DataFrame(data)
+
+def performance_test(num_rows: int = 100000):
+    """
+    Test performance of optimized vs standard processing.
+    
+    Args:
+        num_rows: Number of rows to test with
+    """
+    import time
+    
+    logger.info(f"=== PERFORMANCE TEST: {num_rows:,} ROWS ===")
+    
+    # Create test data
+    test_df = create_large_test_dataset(num_rows)
+    logger.info(f"Test dataset created: {len(test_df):,} rows, {test_df.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
+    
+    # Test optimized processor
+    logger.info("Testing OptimizedDataProcessor...")
+    start_time = time.time()
+    
+    optimized_processor = OptimizedDataProcessor()
+    optimized_results = optimized_processor.process_text_data_chunked(df=test_df)
+    
+    optimized_time = time.time() - start_time
+    
+    logger.info(f"Optimized processing completed in {optimized_time:.2f} seconds")
+    logger.info(f"Processed {len(test_df):,} → {len(optimized_results):,} rows ({len(optimized_results)/len(test_df)*100:.1f}% relevant)")
+    logger.info(f"Processing rate: {len(test_df)/optimized_time:,.0f} rows/second")
+    
+    # Estimate time for 7 million rows
+    estimated_time_7m = (7_000_000 / len(test_df)) * optimized_time
+    logger.info(f"Estimated time for 7M rows: {estimated_time_7m/60:.1f} minutes")
+    
+    if estimated_time_7m <= 3600:  # 1 hour
+        logger.info("✅ Target of <1 hour for 7M rows should be achievable!")
+    else:
+        logger.warning(f"⚠️  May exceed 1 hour target. Consider further optimization.")
+    
+    return optimized_results, optimized_time
+
 def main():
     """Main function to run the data processing pipeline."""
     
-    # Example usage with sample data that matches the actual schemas
-    logger.info("L'Oréal Datathon 2025 - Data Processing Pipeline")
+    logger.info("L'Oréal Datathon 2025 - Optimized Data Processing Pipeline")
+    
+    # Performance test with different sizes
+    performance_test(10000)   # Small test
+    performance_test(50000)   # Medium test
+    
+    # Sample data demo
+    logger.info("\n=== SAMPLE DATA DEMO ===")
     
     # Create sample data that matches the actual YouTube dataset schemas
     sample_data = {
