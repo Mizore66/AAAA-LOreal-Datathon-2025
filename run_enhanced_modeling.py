@@ -129,6 +129,7 @@ class EnhancedTrendAnalyzer:
             
             # Analyze terms per time window
             window_trends = {}
+            
             for window, window_data in category_data.groupby('time_window'):
                 texts = window_data[text_col].dropna().tolist()
                 window_terms = self.extract_trending_terms(texts, category, top_n=10)
