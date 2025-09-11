@@ -37,16 +37,16 @@ try:
     from sentence_transformers import SentenceTransformer
     from sklearn.cluster import KMeans
     from sklearn.metrics.pairwise import cosine_similarity
-except ImportError:
+except ImportError as e:
     HAS_SENTENCE_TRANSFORMERS = False
     HAS_SKLEARN = False
-    logger.warning("sentence-transformers or sklearn not available, semantic validation disabled")
+    logger.warning(f"sentence-transformers or sklearn not available: {e}, semantic validation disabled")
 
 try:
     from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
-except ImportError:
+except ImportError as e:
     HAS_TRANSFORMERS = False
-    logger.warning("transformers not available, sentiment analysis disabled")
+    logger.warning(f"transformers not available: {e}, sentiment analysis disabled")
 
 try:
     import spacy
@@ -382,6 +382,36 @@ class DemographicsAnalyzer:
             })
         
         return results
+    
+    def calculate_similarity(self, text1: str, text2: str) -> float:
+        """
+        Calculate cosine similarity between two texts using sentence embeddings.
+        
+        Args:
+            text1: First text string
+            text2: Second text string
+            
+        Returns:
+            Cosine similarity score between 0 and 1
+        """
+        if not self.model or not text1 or not text2:
+            return 0.0
+        
+        try:
+            # Generate embeddings for both texts
+            embeddings = self.generate_embeddings([text1, text2])
+            if embeddings is None or len(embeddings) != 2:
+                return 0.0
+            
+            # Calculate cosine similarity
+            similarity_matrix = cosine_similarity([embeddings[0]], [embeddings[1]])
+            similarity_score = similarity_matrix[0][0]
+            
+            return float(similarity_score)
+            
+        except Exception as e:
+            logger.error(f"Error calculating similarity: {e}")
+            return 0.0
 
 class CategoryClassifier:
     """Fine-tune transformer models for category classification."""

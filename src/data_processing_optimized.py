@@ -10,7 +10,7 @@ import re
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Union, Generator
+from typing import List, Dict, Optional, Tuple, Union, Generator, Any
 import logging
 from datetime import datetime, timedelta
 import emoji
@@ -889,6 +889,133 @@ class OptimizedDataProcessor:
         
         else:
             raise ValueError("Either df or filepath must be provided")
+    
+    def process_text_data_chunked_with_save(self, filepath: Union[str, Path] = None, output_dir: Union[str, Path] = None) -> Dict[str, Any]:
+        """
+        Process large text data and save the results, returning file paths for pipeline tracking.
+        
+        Args:
+            filepath: Path to parquet file to process
+            output_dir: Directory to save processed files
+            
+        Returns:
+            Dictionary with processed file paths and statistics
+        """
+        if not filepath:
+            raise ValueError("filepath must be provided")
+            
+        # Set default output directory
+        if not output_dir:
+            output_dir = PROC_DIR / "processed"
+        else:
+            output_dir = Path(output_dir)
+        
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Process the data
+        processed_df = self.process_text_data_chunked(filepath=filepath)
+        
+        if processed_df.empty:
+            logger.warning(f"No processed data to save from {filepath}")
+            return {
+                'processed_files': [],
+                'statistics': {'input_rows': 0, 'output_rows': 0},
+                'source_file': str(filepath)
+            }
+        
+        # Generate output filename
+        input_path = Path(filepath)
+        output_filename = f"{input_path.stem}_processed.parquet"
+        output_path = output_dir / output_filename
+        
+        # Save the processed data
+        logger.info(f"💾 Saving processed data to: {output_path}")
+        processed_df.to_parquet(output_path, compression='snappy')
+        
+        # Extract and save features if we have processed text
+        feature_files = []
+        if 'processed_text' in processed_df.columns:
+            feature_files = self._extract_and_save_features(processed_df, output_dir, input_path.stem)
+        
+        # Return tracking information
+        all_files = [str(output_path)] + feature_files
+        
+        return {
+            'processed_files': all_files,
+            'statistics': {
+                'input_rows': len(processed_df),
+                'output_rows': len(processed_df),
+                'features_extracted': len(feature_files)
+            },
+            'source_file': str(filepath),
+            'main_output': str(output_path)
+        }
+    
+    def _extract_and_save_features(self, df: pd.DataFrame, output_dir: Path, base_name: str) -> List[str]:
+        """Extract features from processed text and save them."""
+        logger.info(f"🔍 Extracting features from {len(df):,} processed records...")
+        feature_files = []
+        
+        if 'processed_text' not in df.columns:
+            return feature_files
+        
+        try:
+            # Extract hashtags
+            hashtags = []
+            keywords = []
+            
+            with tqdm(total=len(df), desc="Extracting features") as pbar:
+                for text in df['processed_text']:
+                    if pd.isna(text):
+                        continue
+                    
+                    text_str = str(text).lower()
+                    
+                    # Extract hashtags
+                    import re
+                    hashtag_matches = re.findall(r'#\w+', text_str)
+                    hashtags.extend(hashtag_matches)
+                    
+                    # Extract beauty/fashion keywords
+                    beauty_keywords = [
+                        'skincare', 'makeup', 'foundation', 'concealer', 'lipstick', 'mascara',
+                        'eyeshadow', 'blush', 'bronzer', 'primer', 'serum', 'moisturizer',
+                        'cleanser', 'toner', 'sunscreen', 'retinol', 'hyaluronic', 'vitamin',
+                        'beauty', 'cosmetics', 'routine', 'tutorial', 'review', 'haul'
+                    ]
+                    
+                    for keyword in beauty_keywords:
+                        if keyword in text_str:
+                            keywords.append(keyword)
+                    
+                    pbar.update(1)
+            
+            # Save hashtags if found
+            if hashtags:
+                hashtag_counts = pd.Series(hashtags).value_counts().reset_index()
+                hashtag_counts.columns = ['feature', 'count']
+                hashtag_counts['type'] = 'hashtag'
+                
+                hashtag_file = output_dir / f"{base_name}_hashtags.parquet"
+                hashtag_counts.to_parquet(hashtag_file, compression='snappy')
+                feature_files.append(str(hashtag_file))
+                logger.info(f"💾 Saved {len(hashtag_counts)} unique hashtags to {hashtag_file}")
+            
+            # Save keywords if found
+            if keywords:
+                keyword_counts = pd.Series(keywords).value_counts().reset_index()
+                keyword_counts.columns = ['feature', 'count']
+                keyword_counts['type'] = 'keyword'
+                
+                keyword_file = output_dir / f"{base_name}_keywords.parquet"
+                keyword_counts.to_parquet(keyword_file, compression='snappy')
+                feature_files.append(str(keyword_file))
+                logger.info(f"💾 Saved {len(keyword_counts)} unique keywords to {keyword_file}")
+        
+        except Exception as e:
+            logger.error(f"Feature extraction failed: {e}")
+        
+        return feature_files
 
 class DataProcessor(OptimizedDataProcessor):
     """Backward compatibility wrapper for the optimized processor."""
