@@ -140,9 +140,23 @@ def get_all_available_terms():
                 if isinstance(category_terms, dict):
                     for term_name in category_terms.keys():
                         all_terms.add(term_name)
-    
-    # Convert to sorted list for better UX
-    return sorted(list(all_terms))
+    # Helper: keep only alphabetic word terms (remove items containing digits or pure symbols)
+    def _is_word_term(term: str) -> bool:
+        if not term:
+            return False
+        clean = term.lstrip('#').replace('_', ' ').strip()
+        if not clean:
+            return False
+        # Split into tokens and ensure each token is alphabetic (allow camelcase)
+        tokens = clean.split()
+        # Reject if any token contains digits or non-alpha chars after stripping punctuation
+        for tk in tokens:
+            if not tk.isalpha():
+                return False
+        return True
+
+    filtered_terms = [t for t in all_terms if _is_word_term(t)]
+    return sorted(filtered_terms)
 
 # Load real data or fallback to sample data
 if 'df_trends' not in st.session_state:

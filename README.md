@@ -19,24 +19,89 @@ A focused, multi-platform trend radar to detect emerging beauty & fashion trends
 
 ---
 
-## 📁 Project Structure (Root)
+
+## �️ Tech Stack & Infrastructure
+
+**Languages & Frameworks:**
+- Python 3.10+ (core pipeline, modeling, dashboard)
+- Streamlit (interactive dashboard)
+- Jupyter Notebook (EDA, pipeline demonstration)
+
+**Data Processing & Storage:**
+- pandas, numpy (tabular manipulation, aggregation)
+- pyarrow (Parquet file IO)
+- openpyxl (Excel ingestion)
+- joblib, pickle (model persistence)
+
+**Feature Engineering & NLP:**
+- scikit-learn (TF-IDF, clustering, classification)
+- transformers, sentence-transformers (semantic validation, embeddings)
+- spacy, autocorrect, langdetect (text cleaning, spell correction, language detection)
+
+**Modeling & Analysis:**
+- statsmodels (trend/seasonal decomposition)
+- Prophet (optional, time-series forecasting)
+- sklearn (classification, clustering)
+- Custom scripts for velocity/acceleration/decay logic
+
+**Visualization:**
+- plotly (exploratory plots, dashboard charts)
+
+**Infrastructure & Automation:**
+- Chunked/batch processing for memory efficiency
+- Modular pipeline scripts (ingestion, processing, modeling, decay analysis)
+- Directory structure for reproducibility and separation of raw/interim/processed/model assets
+
+**Deployment & Execution:**
+- Local execution (Windows PowerShell, bash)
+- Streamlit app for local dashboard hosting
+- Jupyter notebook for stepwise demonstration and validation
+- Automated pipeline runner scripts (full_pipeline.py, run_end_to_end.ipynb)
+
+**Artifacts & Outputs:**
+- Parquet files for efficient data storage
+- JSON reports for profiling, performance, and modeling results
+- Pickled model/vectorizer objects for reproducibility
+- Markdown/HTML reports for documentation
+
+**Optional/Advanced:**
+- Cloud deployment (future roadmap: containerization, scheduled retraining)
+- Real-time ingestion (streaming, append-only parquet)
+
 
 ```
 project_root/
-├── assets/               # Images, logos, etc.
+├── assets/                      # Images, logos, presentation assets
 ├── data/
-│   ├── raw/              # Original data (unzipped here)
-│   ├── processed/        # Cleaned and preprocessed data (e.g., parquet)
-│   └── interim/          # Intermediate outputs & reports
-├── models/               # Saved models
-├── notebooks/            # EDA & experiments
-├── src/                  # Source code
-│   ├── ingest_provided_data.py
-│   ├── data_processing.py
-│   ├── modeling.py
-│   └── visualization.py
-├── requirements.txt      # Dependencies
-└── README.md
+│   ├── raw/                     # Unpacked original source data
+│   ├── processed/               # Legacy processed artifacts (subset)
+│   ├── processed_features/      # Feature text processing outputs
+│   ├── features/                # Raw extracted term vocabularies
+│   ├── interim/                 # Intermediate reports & JSON summaries
+│   ├── feature_processing_reports/ # Logs / detail reports from text processor
+│   ├── cache/                   # Cached pickled intermediate objects
+│   └── reports/                 # Analysis / performance reports
+├── models/                      # Saved models & analysis JSON (incl. decay + enhanced modeling)
+├── final_submission/            # Competition-ready package
+│   ├── app.py                   # Streamlit dashboard (final submission context)
+│   ├── full_pipeline.py         # Orchestrated end-to-end runner
+│   ├── run_end_to_end.ipynb     # Notebook runner (scripted execution)
+│   ├── validate_submission.py   # Validation / integrity script
+│   └── src/                     # Final optimized modules
+│       ├── ingest_provided_data.py
+│       ├── data_processing_optimized.py
+│       ├── feature_text_processor.py
+│       ├── modeling_optimized.py
+│       ├── run_enhanced_modeling.py
+│       ├── term_decay_analysis.py
+│       └── test_full_pipeline.py
+├── model_dev/                   # Development / experimental notebooks
+├── src/                         # Base (earlier) source folder
+│   └── data/                    # May include auxiliary scripts/data (lean after consolidation)
+├── models/                      # (duplicate listing above kept intentionally for clarity)
+├── requirements.txt             # Dependencies
+├── README.md                    # Unified documentation (this file)
+└── .gitignore
 ```
 
 ## 🚀 Quickstart (Windows PowerShell)
@@ -70,24 +135,9 @@ Outputs:
 - Parquet files under `data/processed/`
 - A report at `data/interim/ingest_report.md`
 
-## ⚙️ Pipeline Executor (Automation)
-
-For automated execution and external agent delegation:
-
-```bash
-# Run complete pipeline with auto-commit
-python pipeline_executor.py
-
-# Run without committing (for testing)
-python pipeline_executor.py --no-commit
-
-# Force regenerate all files
-python pipeline_executor.py --force-regenerate
-```
-
-See `PIPELINE_DOCUMENTATION.md` for detailed documentation.
-
 ## 🧪 Manual Pipeline Execution
+
+After that, you can run `full_pipeline.py` to properly process the data and feed it to the model
 
 ### Full dependencies
 
@@ -95,19 +145,6 @@ Install everything for modeling and the Streamlit app:
 
 ```
 pip install -r requirements.txt
-```
-
-### Manual execution steps
-
-```bash
-# Step 1: Data ingestion
-python src/ingest_provided_data.py
-
-# Step 2: Feature engineering and multi-timeframe aggregation
-python src/data_processing.py
-
-# Step 3: Advanced modeling (optional, requires additional dependencies)
-python src/modeling.py
 ```
 
 ## 🔐 Notes on Data Ethics & Platform ToS
