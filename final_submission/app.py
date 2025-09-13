@@ -35,7 +35,7 @@ def load_real_data():
     """Load real data from enhanced modeling results."""
     try:
         # Load enhanced modeling results
-        results_file = Path("../data/interim/enhanced_modeling_results.json")
+        results_file = Path("../models/enhanced_modeling_results.json")
         if not results_file.exists():
             return None
         
@@ -73,8 +73,8 @@ def load_decay_analysis_data():
     """Load real decay analysis data."""
     try:
         # Load both real_term_decay_analysis_results.json and term_decay_analysis_results.json
-        decay_file = Path("../data/interim/real_term_decay_analysis_results.json")
-        term_decay_file = Path("../data/interim/term_decay_analysis_results.json")
+        decay_file = Path("../models/real_term_decay_analysis_results.json")
+        term_decay_file = Path("../models/term_decay_analysis_results.json")
         term_decay_top10_file = Path("term_decay_analysis_results_top10.json")
         
         decay_results = None
@@ -154,7 +154,7 @@ if 'df_trends' not in st.session_state:
         
         # Also load the full results data for temporal analysis
         try:
-            results_file = Path("../data/interim/enhanced_modeling_results.json")
+            results_file = Path("../models/enhanced_modeling_results.json")
             if results_file.exists():
                 with open(results_file, 'r') as f:
                     st.session_state.results_data = json.load(f)
